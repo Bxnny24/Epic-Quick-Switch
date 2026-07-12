@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set version from tag
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart('v')
+          (Get-Content src-tauri/tauri.conf.json -Raw) -replace '"version": "[^"]*"', ('"version": "' + $v + '"') | Set-Content src-tauri/tauri.conf.json -Encoding utf8
+          (Get-Content package.json -Raw) -replace '"version": "[^"]*"', ('"version": "' + $v + '"') | Set-Content package.json -Encoding utf8
+          (Get-Content src-tauri/Cargo.toml -Raw) -replace '(?m)^version = "[^"]*"', ('version = "' + $v + '"') | Set-Content src-tauri/Cargo.toml -Encoding utf8
+          Write-Host "Building version $v"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build, sign and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "${{ github.ref_name }}"
+          releaseBody: "Download the installer below. The app updates itself automatically afterwards."
+          releaseDraft: false
+          prerelease: false
+
+      - name: Publish installer under a stable name
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $exe = Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *-setup.exe | Select-Object -First 1
+          if (-not $exe) { throw "NSIS installer not found" }
+          Copy-Item $exe.FullName EpicQuickSwitch-Setup.exe
+          gh release upload ${{ github.ref_name }} EpicQuickSwitch-Setup.exe --clobber
+
+  update-readme:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Update download button in README
+        run: node scripts/update-readme-version.mjs "${GITHUB_REF_NAME}" "${GITHUB_REPOSITORY}"
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --staged --quiet || git commit -m "docs: update download button to ${GITHUB_REF_NAME}"
+          git push

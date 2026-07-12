@@ -1,0 +1,47 @@
+name: Security Audit
+
+# Dependency / supply-chain auditing for both the Rust and npm trees. Runs on
+# every push and PR to main, weekly, and on demand. Kept separate from the
+# release workflow so advisories surface continuously, not only at release time.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        working-directory: src-tauri
+        run: cargo audit
+
+  npm-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Audit production dependencies; fail only on high/critical advisories.
+      - name: npm audit
+        run: npm audit --omit=dev --audit-level=high
