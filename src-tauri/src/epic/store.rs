@@ -11,7 +11,9 @@
 //! The blob must NEVER be logged; `EpicAccount`'s `Debug` impl redacts it.
 
 use std::fmt;
+use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,19 @@ const STORE_VERSION: u32 = 1;
 /// Marks a DPAPI-wrapped, base64-encoded blob on disk. Values without the
 /// prefix are treated as plaintext (manual recovery / migration path).
 const DPAPI_PREFIX: &str = "dpapi:";
+
+/// Serializes every load-mutate-save sequence on the account store across the
+/// tray's worker threads (and the whole switch), so concurrent actions cannot
+/// clobber each other's writes with a stale full-list snapshot. The
+/// single-instance plugin guarantees one process, so a process-wide lock is
+/// enough. Hold it around a load…save critical section (see [`lock`]).
+static STORE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the store lock, recovering from poisoning — a panic inside one
+/// critical section must not wedge every later store operation.
+pub fn lock() -> MutexGuard<'static, ()> {
+    STORE_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+}
 
 /// One saved account. `remember_me_data` is held decrypted in memory.
 #[derive(Clone, Serialize, Deserialize)]
@@ -38,6 +53,13 @@ pub struct EpicAccount {
     /// Set when a post-switch check saw the launcher reject the token.
     #[serde(default)]
     pub stale: bool,
+    /// The original on-disk wrapped blob when it could not be decrypted on
+    /// load (transient DPAPI failure, wrong user/machine). Kept in memory,
+    /// never serialized, and written back verbatim so an unrelated save does
+    /// not destroy ciphertext that might decrypt fine later. Cleared once the
+    /// account is re-captured.
+    #[serde(skip)]
+    undecryptable_raw: Option<String>,
 }
 
 impl fmt::Debug for EpicAccount {
@@ -93,9 +115,13 @@ impl AccountStore {
                         match unwrap_data(&account.remember_me_data) {
                             Ok(plain) => account.remember_me_data = plain,
                             Err(_) => {
-                                // Undecryptable (other machine/user): keep the
-                                // entry visible but unusable until re-saved.
-                                account.remember_me_data = String::new();
+                                // Undecryptable (transient DPAPI failure, other
+                                // machine/user): blank the usable token so the
+                                // account is unusable-until-re-saved, but keep
+                                // the original ciphertext so a later save does
+                                // not destroy data that might decrypt fine.
+                                account.undecryptable_raw =
+                                    Some(std::mem::take(&mut account.remember_me_data));
                                 account.stale = true;
                             }
                         }
@@ -124,7 +150,12 @@ impl AccountStore {
                 .iter()
                 .cloned()
                 .map(|mut account| {
-                    account.remember_me_data = wrap_data(&account.remember_me_data)?;
+                    // An entry whose blob never decrypted this session keeps
+                    // its original ciphertext; everything else is (re)wrapped.
+                    account.remember_me_data = match account.undecryptable_raw.take() {
+                        Some(raw) => raw,
+                        None => wrap_data(&account.remember_me_data)?,
+                    };
                     Ok(account)
                 })
                 .collect::<Result<Vec<_>, String>>()?,
@@ -132,9 +163,18 @@ impl AccountStore {
         let json = serde_json::to_vec_pretty(&on_disk)
             .map_err(|e| format!("failed to serialize account store: {e}"))?;
 
+        // Durable atomic replace: flush the temp file to disk before the
+        // rename so a crash cannot leave a zero-length/torn accounts.json in
+        // place (which would lose every stored token at once).
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json)
-            .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+        {
+            let mut file = std::fs::File::create(&tmp)
+                .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+            file.write_all(&json)
+                .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+            file.sync_all()
+                .map_err(|e| format!("failed to flush {}: {e}", tmp.display()))?;
+        }
         std::fs::rename(&tmp, &self.path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("failed to replace {}: {e}", self.path.display())
@@ -169,6 +209,7 @@ impl AccountStore {
             existing.remember_me_data = data;
             existing.saved_at = now;
             existing.stale = false;
+            existing.undecryptable_raw = None;
             if !existing.display_name_is_custom {
                 if let Some(name) = log_name {
                     existing.display_name = name;
@@ -185,6 +226,7 @@ impl AccountStore {
                 saved_at: now,
                 last_used: None,
                 stale: false,
+                undecryptable_raw: None,
             });
             UpsertOutcome::Added
         }
@@ -475,9 +517,43 @@ mod tests {
             saved_at: 0,
             last_used: None,
             stale: false,
+            undecryptable_raw: None,
         };
         let debug = format!("{account:?}");
         assert!(!debug.contains("SUPERSECRET"));
         assert!(debug.contains("redacted"));
+    }
+
+    #[test]
+    fn undecryptable_blob_survives_an_unrelated_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(STORE_FILE);
+        // A store on disk with a blob that will fail to DPAPI-decrypt (valid
+        // base64, wrong ciphertext) plus a normal plaintext-passthrough entry.
+        let file = format!(
+            r#"{{"version":1,"accounts":[
+                {{"accountId":"bad","displayName":"Bad","rememberMeData":"dpapi:{}","savedAt":1}},
+                {{"accountId":"good","displayName":"Good","rememberMeData":"plainblob","savedAt":2}}
+            ]}}"#,
+            base64::engine::general_purpose::STANDARD.encode(b"not a real dpapi blob")
+        );
+        std::fs::write(&path, file).expect("write");
+
+        // Load blanks the bad token in memory but keeps the raw ciphertext.
+        let mut store = AccountStore::load_from(path.clone());
+        assert_eq!(store.get("bad").unwrap().remember_me_data, "");
+        assert!(store.get("bad").unwrap().stale);
+
+        // An unrelated action (touch the good account) triggers a full save.
+        store.touch_last_used("good");
+        store.save().expect("save");
+
+        // The bad account's original ciphertext survived on disk byte-for-byte.
+        let reloaded_raw = std::fs::read_to_string(&path).expect("read");
+        let expected = base64::engine::general_purpose::STANDARD.encode(b"not a real dpapi blob");
+        assert!(
+            reloaded_raw.contains(&format!("dpapi:{expected}")),
+            "undecryptable ciphertext must be preserved verbatim"
+        );
     }
 }

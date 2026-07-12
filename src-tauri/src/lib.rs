@@ -40,7 +40,12 @@ pub fn run() {
 
 async fn try_update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
     if let Some(update) = app.updater()?.check().await? {
-        update.download_and_install(|_, _| {}, || {}).await?;
+        // Download first, then gate the install (which terminates the process
+        // on Windows) behind the shared busy lock, so an update can never tear
+        // the process down in the middle of an in-flight account switch.
+        let bytes = update.download(|_, _| {}, || {}).await?;
+        let _guard = epic::store::lock();
+        update.install(bytes)?;
         app.restart();
     }
     Ok(())

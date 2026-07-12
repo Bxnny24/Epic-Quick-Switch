@@ -7,6 +7,7 @@
 //! wrong encoding silently logs the user out of everything.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
 
 /// `Data=` blobs shorter than this are placeholders left behind by a logout,
@@ -59,8 +60,17 @@ pub fn save(path: &Path, file: &IniFile) -> Result<(), String> {
     }
     let bytes = encode(&text, file.encoding);
 
+    // Durable atomic replace: flush to disk before the rename so a crash
+    // cannot leave a torn ini in place (which would log the user out).
     let tmp = path.with_extension("ini.eqs-tmp");
-    fs::write(&tmp, &bytes).map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+    {
+        let mut file = fs::File::create(&tmp)
+            .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+        file.write_all(&bytes)
+            .map_err(|e| format!("failed to write {}: {e}", tmp.display()))?;
+        file.sync_all()
+            .map_err(|e| format!("failed to flush {}: {e}", tmp.display()))?;
+    }
     fs::rename(&tmp, path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("failed to replace {}: {e}", path.display())
@@ -90,24 +100,43 @@ pub fn write_remember_me(file: &mut IniFile, enabled: bool, data: &str) {
     let enable_line = format!("Enable={}", if enabled { "True" } else { "False" });
     let data_line = format!("Data={data}");
 
-    if let Some((start, end)) = section_bounds(&file.lines, "RememberMe") {
+    // Collapse any duplicate [RememberMe] sections to the first, so Unreal's
+    // last-wins merge cannot log the user in with a stale token that we did
+    // not patch (wrong-account login is the worst failure this app can cause).
+    remove_extra_sections(&mut file.lines, "RememberMe");
+
+    if let Some((start, mut end)) = section_bounds(&file.lines, "RememberMe") {
+        // Patch the first Enable=/Data= line and delete any later duplicates
+        // in the section (read and the launcher both honor the last one).
         let mut enable_done = false;
         let mut data_done = false;
-        for line in &mut file.lines[start + 1..end] {
-            if !enable_done && key_value(line, "Enable").is_some() {
-                *line = enable_line.clone();
+        let mut i = start + 1;
+        while i < end {
+            if key_value(&file.lines[i], "Enable").is_some() {
+                if enable_done {
+                    file.lines.remove(i);
+                    end -= 1;
+                    continue;
+                }
+                file.lines[i] = enable_line.clone();
                 enable_done = true;
-            } else if !data_done && key_value(line, "Data").is_some() {
-                *line = data_line.clone();
+            } else if key_value(&file.lines[i], "Data").is_some() {
+                if data_done {
+                    file.lines.remove(i);
+                    end -= 1;
+                    continue;
+                }
+                file.lines[i] = data_line.clone();
                 data_done = true;
             }
+            i += 1;
         }
         // Insert missing keys right after the last non-blank line of the
         // section, keeping any blank separator lines below.
         let mut insert_at = start + 1;
-        for (i, line) in file.lines[start + 1..end].iter().enumerate() {
+        for (j, line) in file.lines[start + 1..end].iter().enumerate() {
             if !line.trim().is_empty() {
-                insert_at = start + 1 + i + 1;
+                insert_at = start + 1 + j + 1;
             }
         }
         if !data_done {
@@ -217,6 +246,33 @@ fn section_bounds(lines: &[String], name: &str) -> Option<(usize, usize)> {
         .map(|i| start + 1 + i)
         .unwrap_or(lines.len());
     Some((start, end))
+}
+
+/// Delete every section named `name` except the first (header plus its body),
+/// so a duplicate section cannot shadow the first under last-wins parsing.
+fn remove_extra_sections(lines: &mut Vec<String>, name: &str) {
+    let header = format!("[{name}]");
+    let Some(first) = lines.iter().position(|l| l.trim().eq_ignore_ascii_case(&header)) else {
+        return;
+    };
+    // Skip past the first section's body to the next header (or EOF).
+    let mut idx = first + 1;
+    while idx < lines.len() && !lines[idx].trim_start().starts_with('[') {
+        idx += 1;
+    }
+    // Drain any further sections that repeat the same header.
+    while idx < lines.len() {
+        if lines[idx].trim().eq_ignore_ascii_case(&header) {
+            let sec_start = idx;
+            let mut sec_end = idx + 1;
+            while sec_end < lines.len() && !lines[sec_end].trim_start().starts_with('[') {
+                sec_end += 1;
+            }
+            lines.drain(sec_start..sec_end);
+        } else {
+            idx += 1;
+        }
+    }
 }
 
 /// The trimmed value if `line` is `key=value` for the given key (ASCII
@@ -368,6 +424,33 @@ mod tests {
         assert!(file.trailing_newline);
         // Original content untouched.
         assert!(out.starts_with("[Other]\nKey=Value"));
+    }
+
+    #[test]
+    fn write_removes_duplicate_data_lines() {
+        // A malformed ini (hand edit / third-party tool) with two Data= lines:
+        // the launcher would honor the LAST, so both must be collapsed.
+        let text = "[RememberMe]\nEnable=True\nData=STALE\nData=ALSO_STALE\n\n[Other]\nK=V\n";
+        let mut file = from_text(text, IniEncoding::Utf8 { bom: false });
+        write_remember_me(&mut file, true, "FRESH");
+        let out = file.lines.join("\n");
+        assert_eq!(out.matches("Data=").count(), 1, "exactly one Data line");
+        assert!(out.contains("Data=FRESH"));
+        assert!(!out.contains("STALE"));
+        assert!(out.contains("[Other]\nK=V"));
+    }
+
+    #[test]
+    fn write_collapses_duplicate_sections() {
+        let text = "[RememberMe]\nEnable=True\nData=FIRST\n\n[Other]\nK=V\n\n[RememberMe]\nEnable=True\nData=STALE_LAST\n";
+        let mut file = from_text(text, IniEncoding::Utf8 { bom: false });
+        write_remember_me(&mut file, true, "FRESH");
+        let out = file.lines.join("\n");
+        assert_eq!(out.matches("[RememberMe]").count(), 1, "single section");
+        assert_eq!(out.matches("Data=").count(), 1);
+        assert!(out.contains("Data=FRESH"));
+        assert!(!out.contains("STALE_LAST"));
+        assert!(out.contains("[Other]\nK=V"));
     }
 
     #[test]

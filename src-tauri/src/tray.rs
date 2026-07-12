@@ -2,6 +2,7 @@
 //! (with generated initials badges), a "save current account" action, account
 //! removal, and settings; the tray icon shows the active account's badge.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tauri::{
@@ -22,6 +23,10 @@ const MENU_ICON_SIZE: u32 = 18;
 const WATCH_INTERVAL: Duration = Duration::from_secs(3);
 /// How long after a switch to check whether Epic accepted the restored token.
 const STALE_CHECK_DELAY: Duration = Duration::from_secs(20);
+
+/// Bumped on every switch. A pending post-switch stale check bails out if a
+/// newer switch has started, so it can never blame a superseded account.
+static SWITCH_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Display name: Epic username or short account ID, per the user's setting.
 fn display_name(app: &AppHandle, account: &Account) -> String {
@@ -248,6 +253,8 @@ fn switch_to(app: &AppHandle, account_id: String) {
     let Some(account) = accounts.into_iter().find(|a| a.account_id == account_id) else {
         return;
     };
+    // Claim a generation so a later switch supersedes this one's stale check.
+    let generation = SWITCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let app = app.clone();
     std::thread::spawn(move || {
         let l = i18n::labels(&settings::language(&app));
@@ -265,12 +272,19 @@ fn switch_to(app: &AppHandle, account_id: String) {
 
         // The token blob is opaque, so an expired session can only be seen
         // after the launcher tried it: if it logs the user out again, mark
-        // the snapshot and tell the user how to fix it.
+        // the snapshot and tell the user how to fix it. Bail out if a newer
+        // switch superseded this one (else we'd blame the wrong account).
         std::thread::sleep(STALE_CHECK_DELAY);
-        if switch::session_rejected() {
-            let mut store = store::AccountStore::load(&app);
-            store.mark_stale(&account.account_id);
-            let _ = store.save();
+        if SWITCH_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        if switch::session_rejected(&account.account_id) {
+            {
+                let _guard = store::lock();
+                let mut store = store::AccountStore::load(&app);
+                store.mark_stale(&account.account_id);
+                let _ = store.save();
+            }
             let name = display_name(&app, &account);
             show_error(
                 l.session_expired_title,
@@ -316,6 +330,7 @@ fn remove_clicked(app: &AppHandle, account_id: String) {
     std::thread::spawn(move || {
         let l = i18n::labels(&settings::language(&app));
         if confirm(l.remove_account, &i18n::with_name(l.remove_confirm, &name)) {
+            let _guard = store::lock();
             let mut store = store::AccountStore::load(&app);
             store.remove(&account.account_id);
             let _ = store.save();

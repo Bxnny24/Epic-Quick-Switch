@@ -15,10 +15,12 @@
 //! it runs, and the on-disk token is current from the moment of login.
 
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use sysinfo::System;
 use tauri::AppHandle;
 
 use crate::epic::accounts::SessionState;
@@ -33,11 +35,13 @@ const SETTLE_DELAY: Duration = Duration::from_millis(500);
 /// `CREATE_NO_WINDOW`: stops console helpers (tasklist/taskkill) from flashing.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Everything Epic spawns. Order matters: the launcher first, so it cannot
-/// respawn helpers; leftover helpers stall the next start by 1–2 minutes.
-const EPIC_PROCESSES: [&str; 6] = [
-    "EpicGamesLauncher.exe",
-    "EpicWebHelper.exe",
+/// Launcher-unique image names, safe to force-kill by name.
+const LAUNCHER_PROCESSES: [&str; 2] = ["EpicGamesLauncher.exe", "EpicWebHelper.exe"];
+
+/// Generic Unreal/EOS image names shared with the Unreal Editor and other UE
+/// games. Killing these by name would take down unrelated apps, so only
+/// instances living under the launcher's own tree are terminated (by PID).
+const SCOPED_PROCESSES: [&str; 4] = [
     "UnrealCEFSubProcess.exe",
     "EOSOverlayRenderer-Win64-Shipping.exe",
     "EpicOnlineServicesUserHelper.exe",
@@ -69,6 +73,7 @@ pub struct SavedAccount {
 /// Snapshot the launcher's current session into the store. Read-only towards
 /// the launcher, so it works while the launcher is running.
 pub fn save_current(app: &AppHandle) -> Result<SavedAccount, SaveError> {
+    let _guard = store::lock();
     let location = paths::resolve_ini().map_err(|_| SaveError::NoLauncherData)?;
     let file = ini::load(&location.primary).map_err(|_| SaveError::NoLauncherData)?;
     let remember = ini::read_remember_me(&file).ok_or(SaveError::NoSession)?;
@@ -96,6 +101,12 @@ pub fn save_current(app: &AppHandle) -> Result<SavedAccount, SaveError> {
 
 /// Switch the live Epic session to the saved account `account_id`.
 pub fn switch_account(app: &AppHandle, account_id: &str) -> Result<(), String> {
+    // Serialize the whole switch: this prevents two interleaved kill/relaunch
+    // sequences, stops a concurrent store write from clobbering our updates,
+    // and (as the app's single "busy" mutex) blocks the auto-updater from
+    // exiting the process mid-switch.
+    let _guard = store::lock();
+
     let mut store = store::AccountStore::load(app);
     let target = store
         .get(account_id)
@@ -114,14 +125,17 @@ pub fn switch_account(app: &AppHandle, account_id: &str) -> Result<(), String> {
         .ok_or_else(|| "Epic Games Launcher not found.".to_string())?;
     let location = paths::resolve_ini()?;
 
-    if is_launcher_running() {
-        kill_launcher()?;
+    // Fail closed: if we cannot tell whether the launcher is running, abort
+    // rather than skip the kill and let a live launcher clobber our write.
+    if is_launcher_running()? {
+        kill_launcher(&exe)?;
         thread::sleep(SETTLE_DELAY);
     }
 
     // Snapshot the outgoing session (post-kill: the launcher has flushed its
-    // final ini state). This keeps the away-account's token fresh — the best
-    // defense against expiring snapshots.
+    // final ini state) and PERSIST it before the destructive write below, so a
+    // later spawn/save failure cannot lose the only fresh copy of that token.
+    let mut outgoing_saved = false;
     if let Ok(file) = ini::load(&location.primary) {
         if let Some(remember) = ini::read_remember_me(&file) {
             if remember.is_valid() {
@@ -131,10 +145,14 @@ pub fn switch_account(app: &AppHandle, account_id: &str) -> Result<(), String> {
                     {
                         let data = remember.data.expect("validated above");
                         store.upsert_session(&current_id, data, None);
+                        outgoing_saved = true;
                     }
                 }
             }
         }
+    }
+    if outgoing_saved {
+        store.save()?;
     }
 
     // Write the target session: primary is authoritative, the mirror (the
@@ -154,17 +172,22 @@ pub fn switch_account(app: &AppHandle, account_id: &str) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("failed to relaunch the Epic Games Launcher: {e}"))?;
 
+    // Best-effort bookkeeping: the switch has already succeeded, so a failure
+    // to persist `last_used` must not report the whole switch as failed.
     store.touch_last_used(&target.account_id);
-    store.save()?;
+    let _ = store.save();
 
     Ok(())
 }
 
-/// Whether the launcher rejected the restored token (used by the tray's
-/// post-switch check ~20s after a switch): a logged-out live session means
-/// the snapshot is stale.
-pub fn session_rejected() -> bool {
+/// Whether the launcher rejected the token just restored for `expected_id`
+/// (used by the tray's post-switch check ~20s after a switch). A logged-out
+/// live session only counts when the registry identity still names the account
+/// we switched to — otherwise a newer switch or a manual logout is being
+/// misattributed to this one.
+pub fn session_rejected(expected_id: &str) -> bool {
     matches!(accounts::live_session(), SessionState::LoggedOut)
+        && registry::account_id().is_some_and(|id| id.eq_ignore_ascii_case(expected_id))
 }
 
 fn write_session(path: &std::path::Path, data: &str) -> Result<(), String> {
@@ -190,35 +213,70 @@ fn silent_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
     cmd
 }
 
-/// Whether the launcher's main process is currently running.
-pub fn is_launcher_running() -> bool {
-    silent_command("tasklist")
+/// Whether the launcher's main process is currently running. Returns `Err`
+/// when the check itself could not run (e.g. `tasklist` blocked by policy),
+/// so callers can fail closed instead of assuming "not running".
+pub fn is_launcher_running() -> Result<bool, String> {
+    let output = silent_command("tasklist")
         .args(["/FI", "IMAGENAME eq EpicGamesLauncher.exe", "/NH", "/FO", "CSV"])
         .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .to_lowercase()
-                .contains("epicgameslauncher.exe")
-        })
-        .unwrap_or(false)
+        .map_err(|e| format!("could not check whether the Epic Games Launcher is running: {e}"))?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .to_lowercase()
+        .contains("epicgameslauncher.exe"))
 }
 
-/// Force-kill the launcher and all of its helper processes, then confirm the
-/// main process is gone. Epic ignores graceful close requests, and helpers
-/// orphaned by a partial kill make the next start hang — so all six images
-/// are force-killed every time.
-fn kill_launcher() -> Result<(), String> {
-    for image in EPIC_PROCESSES {
+/// Force-kill the launcher and its helper processes, then confirm the main
+/// process is gone. Epic ignores graceful close requests, and helpers orphaned
+/// by a partial kill make the next start hang — so the launcher-owned images
+/// are killed by name and the generic Unreal/EOS helpers are killed by PID
+/// only within the launcher's own install tree (`kill_scoped_processes`).
+fn kill_launcher(exe: &Path) -> Result<(), String> {
+    for image in LAUNCHER_PROCESSES {
         let _ = silent_command("taskkill").args(["/F", "/IM", image]).output();
     }
+    kill_scoped_processes(exe);
 
     let start = Instant::now();
     while start.elapsed() < KILL_CONFIRM_TIMEOUT {
-        if !is_launcher_running() {
+        // Treat a check failure as "still running" so a broken tasklist falls
+        // through to the timeout error rather than falsely confirming the kill.
+        if !is_launcher_running().unwrap_or(true) {
             return Ok(());
         }
         thread::sleep(POLL_INTERVAL);
     }
 
     Err("The Epic Games Launcher did not shut down in time.".to_string())
+}
+
+/// Kill the generic Unreal/EOS helper processes, but only instances whose
+/// executable lives under the launcher's own tree (or the Epic Online Services
+/// runtime) — leaving the Unreal Editor and third-party UE games untouched.
+fn kill_scoped_processes(launcher_exe: &Path) {
+    // The launcher's install root, e.g. `...\Epic Games\Launcher`.
+    let launcher_root = launcher_exe
+        .ancestors()
+        .find(|a| {
+            a.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("Launcher"))
+        })
+        .map(|p| p.to_string_lossy().to_lowercase());
+
+    let sys = System::new_all();
+    for process in sys.processes().values() {
+        let name = process.name().to_string_lossy();
+        if !SCOPED_PROCESSES.iter().any(|n| name.eq_ignore_ascii_case(n)) {
+            continue;
+        }
+        let Some(exe) = process.exe() else {
+            continue;
+        };
+        let path = exe.to_string_lossy().to_lowercase();
+        let under_launcher = launcher_root.as_deref().is_some_and(|r| path.starts_with(r));
+        let under_eos = path.contains("\\epic online services\\");
+        if under_launcher || under_eos {
+            let _ = process.kill();
+        }
+    }
 }
