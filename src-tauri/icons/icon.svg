@@ -1,0 +1,17 @@
+<!-- Epic Quick Switch app icon source ("badge swap").
+     Design language mirrors the tray badges in src/epic/icon.rs: flat rounded
+     squares (28% corner radius), palette blue #3B82F6 + violet #8B5CF6, on a
+     dark slate tile. The white double-headed arrow = switching accounts.
+     Regenerate the icon set: render this at 1024x1024 to PNG, then run
+     `npm run tauri -- icon <png>`. -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <!-- tile: rounded square, 28% radius like the tray badges -->
+  <rect x="0" y="0" width="1024" height="1024" rx="287" fill="#151C2C"/>
+  <!-- back badge (account A) -->
+  <rect x="90" y="90" width="470" height="470" rx="132" fill="#3B82F6"/>
+  <!-- front badge (account B), tile-colored separator behind it -->
+  <rect x="438" y="438" width="522" height="522" rx="146" fill="#151C2C"/>
+  <rect x="464" y="464" width="470" height="470" rx="132" fill="#8B5CF6"/>
+  <!-- swap arrow across the diagonal -->
+  <polygon points="270,270 457.2,308.8 414.1,351.9 672.1,609.9 715.2,566.8 754,754 566.8,715.2 609.9,672.1 351.9,414.1 308.8,457.2" fill="#FFFFFF" stroke="#151C2C" stroke-width="36" stroke-linejoin="round"/>
+</svg>
