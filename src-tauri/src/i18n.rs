@@ -24,6 +24,18 @@ pub struct Labels {
     pub err_no_launcher_data: &'static str,
     pub err_no_session: &'static str,
     pub err_no_account_id: &'static str,
+    pub err_account_missing: &'static str,
+    pub err_snapshot_invalid: &'static str,
+    pub err_snapshot_stale: &'static str,
+    pub err_launcher_not_found: &'static str,
+    pub err_check_failed: &'static str,
+    pub err_kill_timeout: &'static str,
+    pub err_store_write: &'static str,
+    pub err_ini_write: &'static str,
+    pub err_relaunch: &'static str,
+    pub autostart_failed: &'static str,
+    pub already_running: &'static str,
+    pub switch_busy: &'static str,
 }
 
 /// Substitute `{name}` in a template label.
@@ -55,6 +67,18 @@ pub fn labels(lang: &str) -> Labels {
             err_no_launcher_data: "Epic Games Launcher-Daten nicht gefunden. Starte den Launcher einmal und logge dich ein.",
             err_no_session: "Keine aktive Epic-Sitzung gefunden. Logge dich im Epic Games Launcher mit aktiviertem \u{201e}Angemeldet bleiben\u{201c} ein und versuche es erneut.",
             err_no_account_id: "Die Konto-ID konnte nicht ermittelt werden. Starte den Epic Games Launcher einmal eingeloggt und versuche es erneut.",
+            err_account_missing: "Dieses Konto ist nicht mehr im Switcher vorhanden.",
+            err_snapshot_invalid: "Die gespeicherte Sitzung f\u{fc}r dieses Konto ist ung\u{fc}ltig. Im Epic Games Launcher einloggen und \u{201e}Aktuelles Konto speichern\u{201c} erneut ausf\u{fc}hren.",
+            err_snapshot_stale: "Die gespeicherte Sitzung f\u{fc}r dieses Konto ist abgelaufen. Im Epic Games Launcher mit diesem Konto einloggen und \u{201e}Aktuelles Konto speichern\u{201c} erneut ausf\u{fc}hren.",
+            err_launcher_not_found: "Epic Games Launcher wurde nicht gefunden.",
+            err_check_failed: "Es konnte nicht gepr\u{fc}ft werden, ob der Epic Games Launcher l\u{e4}uft.",
+            err_kill_timeout: "Der Epic Games Launcher wurde nicht rechtzeitig beendet.",
+            err_store_write: "Der Kontospeicher konnte nicht geschrieben werden.",
+            err_ini_write: "Die Epic-Sitzungsdatei konnte nicht geschrieben werden.",
+            err_relaunch: "Der Epic Games Launcher konnte nicht neu gestartet werden.",
+            autostart_failed: "Die Autostart-Einstellung konnte nicht ge\u{e4}ndert werden.",
+            already_running: "Epic Quick Switch l\u{e4}uft bereits im Infobereich.",
+            switch_busy: "Ein Kontowechsel l\u{e4}uft bereits. Bitte warten, bis er abgeschlossen ist.",
         }
     } else {
         Labels {
@@ -79,6 +103,18 @@ pub fn labels(lang: &str) -> Labels {
             err_no_launcher_data: "Epic Games Launcher data not found. Start the launcher once and log in first.",
             err_no_session: "No active Epic session found. Log in to the Epic Games Launcher with \u{201c}Remember me\u{201d} enabled, then try again.",
             err_no_account_id: "Couldn't determine the account ID. Start the Epic Games Launcher once while logged in, then try again.",
+            err_account_missing: "This account is no longer in the switcher.",
+            err_snapshot_invalid: "The saved session for this account is invalid. Log in to the Epic Games Launcher and use \u{201c}Save current account\u{201d} again.",
+            err_snapshot_stale: "The saved session for this account has expired. Log in to the Epic Games Launcher with this account and use \u{201c}Save current account\u{201d} again.",
+            err_launcher_not_found: "Epic Games Launcher not found.",
+            err_check_failed: "Couldn't determine whether the Epic Games Launcher is running.",
+            err_kill_timeout: "The Epic Games Launcher did not shut down in time.",
+            err_store_write: "The account store could not be written.",
+            err_ini_write: "The Epic session file could not be written.",
+            err_relaunch: "The Epic Games Launcher could not be restarted.",
+            autostart_failed: "Couldn't change the autostart setting.",
+            already_running: "Epic Quick Switch is already running in the system tray.",
+            switch_busy: "An account switch is already in progress. Please wait for it to finish.",
         }
     }
 }

@@ -78,8 +78,12 @@ pub fn save(path: &Path, file: &IniFile) -> Result<(), String> {
 }
 
 /// Read the `[RememberMe]` section. `None` if the section does not exist.
+/// With duplicate sections (malformed file), the LAST one is read — Unreal's
+/// config parsing is last-wins, so that is the section the launcher honors.
+/// (The write path collapses duplicates, so this only matters before the
+/// first write.)
 pub fn read_remember_me(file: &IniFile) -> Option<RememberMe> {
-    let (start, end) = section_bounds(&file.lines, "RememberMe")?;
+    let (start, end) = last_section_bounds(&file.lines, "RememberMe")?;
     let mut remember = RememberMe { enabled: false, data: None };
     for line in &file.lines[start + 1..end] {
         if let Some(value) = key_value(line, "Enable") {
@@ -240,12 +244,26 @@ fn section_bounds(lines: &[String], name: &str) -> Option<(usize, usize)> {
     let start = lines
         .iter()
         .position(|l| l.trim().eq_ignore_ascii_case(&header))?;
+    Some(bounds_from(lines, start))
+}
+
+/// Like [`section_bounds`], but for the LAST occurrence of the section —
+/// matching Unreal's last-wins parsing on malformed duplicate-section files.
+fn last_section_bounds(lines: &[String], name: &str) -> Option<(usize, usize)> {
+    let header = format!("[{name}]");
+    let start = lines
+        .iter()
+        .rposition(|l| l.trim().eq_ignore_ascii_case(&header))?;
+    Some(bounds_from(lines, start))
+}
+
+fn bounds_from(lines: &[String], start: usize) -> (usize, usize) {
     let end = lines[start + 1..]
         .iter()
         .position(|l| l.trim_start().starts_with('['))
         .map(|i| start + 1 + i)
         .unwrap_or(lines.len());
-    Some((start, end))
+    (start, end)
 }
 
 /// Delete every section named `name` except the first (header plus its body),
@@ -366,6 +384,18 @@ mod tests {
     fn read_remember_me_is_none_without_section() {
         let file = from_text("[Other]\nKey=Value\n", IniEncoding::Utf8 { bom: false });
         assert!(read_remember_me(&file).is_none());
+    }
+
+    #[test]
+    fn read_honors_last_duplicate_section_like_the_launcher() {
+        // Malformed file with two [RememberMe] sections: Unreal's last-wins
+        // parsing means the launcher uses the SECOND one — reads must agree,
+        // or live-session state reflects a token the launcher ignores.
+        let text = "[RememberMe]\nEnable=False\nData=\n\n[Other]\nK=V\n\n[RememberMe]\nEnable=True\nData=live_token\n";
+        let file = from_text(text, IniEncoding::Utf8 { bom: false });
+        let rm = read_remember_me(&file).expect("section exists");
+        assert!(rm.enabled);
+        assert_eq!(rm.data.as_deref(), Some("live_token"));
     }
 
     #[test]

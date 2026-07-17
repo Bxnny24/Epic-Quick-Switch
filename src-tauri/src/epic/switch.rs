@@ -8,8 +8,8 @@
 //!      refreshes the token of the account being switched away from).
 //!   3. Write the target account's `[RememberMe]` token into the ini and its
 //!      `AccountId` into the registry.
-//!   4. Relaunch the launcher minimized (`-silent`); it logs in with the
-//!      restored token, no password prompt.
+//!   4. Relaunch the launcher in the foreground (no `-silent`); it logs in
+//!      with the restored token, no password prompt.
 //!
 //! Saving (`save_current`) does NOT kill the launcher: reads are safe while
 //! it runs, and the on-disk token is current from the moment of login.
@@ -55,10 +55,49 @@ pub enum SaveError {
     NoLauncherData,
     /// Logged out, "Remember me" off, or the token is a logout placeholder.
     NoSession,
-    /// No account ID in the registry and none recoverable from the logs.
+    /// No account ID in the registry (e.g. the launcher is still starting up
+    /// right after a switch — logs are deliberately NOT used as a fallback).
     NoAccountId,
     /// The snapshot store could not be written.
     Store(String),
+}
+
+/// Why a switch failed — mapped to localized dialog text in the tray. The
+/// `String` payloads carry the technical reason, appended to the localized
+/// message as a detail line.
+#[derive(Debug)]
+pub enum SwitchError {
+    /// The clicked account is no longer in the store (stale menu entry).
+    AccountMissing,
+    /// The stored token is too short to be a real session.
+    SnapshotInvalid,
+    /// The snapshot was marked stale after Epic rejected it — switching would
+    /// only log the user out, so it is refused until re-saved.
+    SnapshotStale,
+    LauncherNotFound,
+    /// No launcher config found (never run / not installed).
+    ConfigNotFound,
+    /// Could not determine whether the launcher is running (fail closed).
+    CheckFailed(String),
+    KillTimeout,
+    /// Persisting the outgoing session snapshot failed (post-kill).
+    StoreSave(String),
+    /// Writing the session ini failed (post-kill).
+    IniWrite(String),
+    /// Relaunching the launcher failed (post-kill).
+    Relaunch(String),
+}
+
+/// What a successful `switch_account` actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchOutcome {
+    /// Full switch: launcher killed, token written, launcher relaunched. The
+    /// caller should schedule the post-switch rejection check.
+    Switched,
+    /// The target already owned the live session and the launcher is running —
+    /// nothing was touched. No rejection check must be scheduled (a manual
+    /// logout right after the click would be misread as an expired token).
+    AlreadyActive,
 }
 
 /// The account a successful `save_current` stored. The tray currently shows
@@ -82,9 +121,14 @@ pub fn save_current(app: &AppHandle) -> Result<SavedAccount, SaveError> {
     }
     let data = remember.data.expect("validated above");
 
-    let account_id = registry::account_id()
-        .or_else(|| logs::latest_identity().map(|i| i.account_id))
-        .ok_or(SaveError::NoAccountId)?;
+    // The account being saved is whoever owns the launcher's live session:
+    // always the registry AccountId, never the logs. The launcher records
+    // `-epicusername/-epicuserid` only on GAME LAUNCH, so right after a switch
+    // or login the newest log identity still names the PREVIOUS account —
+    // trusting it here would file this session's token under the wrong
+    // account. If the registry has no id yet (launcher still starting up after
+    // a switch), fail closed so the user just retries once it has settled.
+    let account_id = registry::account_id().ok_or(SaveError::NoAccountId)?;
 
     let log_name = logs::username_for(&account_id);
 
@@ -100,7 +144,7 @@ pub fn save_current(app: &AppHandle) -> Result<SavedAccount, SaveError> {
 }
 
 /// Switch the live Epic session to the saved account `account_id`.
-pub fn switch_account(app: &AppHandle, account_id: &str) -> Result<(), String> {
+pub fn switch_account(app: &AppHandle, account_id: &str) -> Result<SwitchOutcome, SwitchError> {
     // Serialize the whole switch: this prevents two interleaved kill/relaunch
     // sequences, stops a concurrent store write from clobbering our updates,
     // and (as the app's single "busy" mutex) blocks the auto-updater from
@@ -111,40 +155,70 @@ pub fn switch_account(app: &AppHandle, account_id: &str) -> Result<(), String> {
     let target = store
         .get(account_id)
         .cloned()
-        .ok_or_else(|| "Account not found in the switcher.".to_string())?;
+        .ok_or(SwitchError::AccountMissing)?;
     if target.remember_me_data.len() <= ini::MIN_DATA_LEN {
-        return Err(
-            "The saved session for this account is invalid or expired. Log in to the Epic Games Launcher and use 'Save current account' again."
-                .to_string(),
-        );
+        return Err(SwitchError::SnapshotInvalid);
+    }
+    // A token Epic already rejected can only log the user out — refuse the
+    // switch until the account is re-saved (which clears `stale`).
+    if target.stale {
+        return Err(SwitchError::SnapshotStale);
+    }
+
+    // Already active AND the launcher is actually running? Then a "switch"
+    // would only kill and relaunch the very session the user is on (possible
+    // via a stale menu, or while the registry id was briefly unreadable and no
+    // entry was disabled). Treat as success without touching anything. When
+    // the launcher is NOT running (e.g. a previous switch wrote the token but
+    // failed to relaunch), fall through: the full flow is what starts it.
+    if let SessionState::LoggedIn { account_id: Some(ref live_id) } = accounts::live_session() {
+        if live_id.eq_ignore_ascii_case(&target.account_id)
+            && is_launcher_running().unwrap_or(false)
+        {
+            store.touch_last_used(&target.account_id);
+            let _ = store.save();
+            return Ok(SwitchOutcome::AlreadyActive);
+        }
     }
 
     // Resolve everything BEFORE killing anything: never take the launcher
     // down if it cannot be relaunched or the config cannot be found.
-    let exe = paths::launcher_exe()
-        .ok_or_else(|| "Epic Games Launcher not found.".to_string())?;
-    let location = paths::resolve_ini()?;
+    let exe = paths::launcher_exe().ok_or(SwitchError::LauncherNotFound)?;
+    let location = paths::resolve_ini().map_err(|_| SwitchError::ConfigNotFound)?;
 
     // Fail closed: if we cannot tell whether the launcher is running, abort
     // rather than skip the kill and let a live launcher clobber our write.
-    if is_launcher_running()? {
-        kill_launcher(&exe)?;
+    if is_launcher_running().map_err(SwitchError::CheckFailed)? {
+        kill_launcher(&exe).map_err(|_| SwitchError::KillTimeout)?;
         thread::sleep(SETTLE_DELAY);
+    } else {
+        // Main process already gone (crash/manual kill) — still sweep up any
+        // orphaned processes, which would otherwise stall the relaunch. This
+        // includes the launcher-unique images (EpicWebHelper.exe!), not just
+        // the scoped Unreal/EOS helpers.
+        kill_launcher_images();
+        kill_scoped_processes(&exe);
     }
 
     // Snapshot the outgoing session (post-kill: the launcher has flushed its
     // final ini state) and PERSIST it before the destructive write below, so a
     // later spawn/save failure cannot lose the only fresh copy of that token.
+    // Never-saved accounts are added too — silently discarding a live session
+    // (forcing a manual re-login later) is the worse failure.
     let mut outgoing_saved = false;
     if let Ok(file) = ini::load(&location.primary) {
         if let Some(remember) = ini::read_remember_me(&file) {
             if remember.is_valid() {
                 if let Some(current_id) = registry::account_id() {
+                    // Explicitly removed accounts are NOT re-captured: the
+                    // user deleted that token on purpose (tombstone lifts on
+                    // a manual re-save).
                     if !current_id.eq_ignore_ascii_case(&target.account_id)
-                        && store.get(&current_id).is_some()
+                        && !store.is_removed(&current_id)
                     {
                         let data = remember.data.expect("validated above");
-                        store.upsert_session(&current_id, data, None);
+                        let log_name = logs::username_for(&current_id);
+                        store.upsert_session(&current_id, data, log_name);
                         outgoing_saved = true;
                     }
                 }
@@ -152,32 +226,44 @@ pub fn switch_account(app: &AppHandle, account_id: &str) -> Result<(), String> {
         }
     }
     if outgoing_saved {
-        store.save()?;
+        store.save().map_err(SwitchError::StoreSave)?;
     }
 
     // Write the target session: primary is authoritative, the mirror (the
     // other candidate ini, if it exists) is best-effort so no launcher build
     // reads a stale token.
-    write_session(&location.primary, &target.remember_me_data)?;
+    write_session(&location.primary, &target.remember_me_data).map_err(SwitchError::IniWrite)?;
     if let Some(mirror) = &location.mirror {
         let _ = write_session(mirror, &target.remember_me_data);
     }
 
     // Registry identity: consistency polish, not load-bearing — the ini token
-    // is what logs in. Warn-and-continue on failure.
+    // is what logs in. Best-effort: a failure here is invisible by design,
+    // because failing the whole switch over it would be worse.
     let _ = registry::set_account_id(&target.account_id);
 
+    // Relaunch in the FOREGROUND so the launcher visibly comes up on the
+    // switched account. Dropping `-silent` (which starts it minimized to the
+    // tray) is what makes the window open; CREATE_NO_WINDOW from
+    // `silent_command` only suppresses a console window and is ignored for the
+    // launcher's GUI process, so it does not hide the window.
     silent_command(&exe)
-        .arg("-silent")
         .spawn()
-        .map_err(|e| format!("failed to relaunch the Epic Games Launcher: {e}"))?;
+        .map_err(|e| SwitchError::Relaunch(e.to_string()))?;
+
+    // Capture the display name at switch time from the target's OWN log
+    // identity (looked up by account ID, so never the outgoing account's
+    // name). Best-effort and non-custom-only: this makes the switch itself
+    // refresh the name, so a "save current account" done right afterwards no
+    // longer depends on logs that lag the just-restored session.
+    store.refresh_log_name(&target.account_id, logs::username_for(&target.account_id));
 
     // Best-effort bookkeeping: the switch has already succeeded, so a failure
     // to persist `last_used` must not report the whole switch as failed.
     store.touch_last_used(&target.account_id);
     let _ = store.save();
 
-    Ok(())
+    Ok(SwitchOutcome::Switched)
 }
 
 /// Whether the launcher rejected the token just restored for `expected_id`
@@ -232,9 +318,7 @@ pub fn is_launcher_running() -> Result<bool, String> {
 /// are killed by name and the generic Unreal/EOS helpers are killed by PID
 /// only within the launcher's own install tree (`kill_scoped_processes`).
 fn kill_launcher(exe: &Path) -> Result<(), String> {
-    for image in LAUNCHER_PROCESSES {
-        let _ = silent_command("taskkill").args(["/F", "/IM", image]).output();
-    }
+    kill_launcher_images();
     kill_scoped_processes(exe);
 
     let start = Instant::now();
@@ -248,6 +332,13 @@ fn kill_launcher(exe: &Path) -> Result<(), String> {
     }
 
     Err("The Epic Games Launcher did not shut down in time.".to_string())
+}
+
+/// Force-kill the launcher-unique images by name (main process + web helper).
+fn kill_launcher_images() {
+    for image in LAUNCHER_PROCESSES {
+        let _ = silent_command("taskkill").args(["/F", "/IM", image]).output();
+    }
 }
 
 /// Kill the generic Unreal/EOS helper processes, but only instances whose

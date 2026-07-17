@@ -76,9 +76,16 @@ impl fmt::Debug for EpicAccount {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StoreFileFormat {
     version: u32,
     accounts: Vec<EpicAccount>,
+    /// Tombstones for explicitly removed accounts (lowercased ids). The
+    /// switch's outgoing auto-save consults this so a deliberately deleted
+    /// token is not silently re-captured; a manual "save current account"
+    /// clears the tombstone.
+    #[serde(default)]
+    removed_ids: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -90,6 +97,7 @@ pub enum UpsertOutcome {
 pub struct AccountStore {
     path: PathBuf,
     accounts: Vec<EpicAccount>,
+    removed_ids: Vec<String>,
 }
 
 impl AccountStore {
@@ -102,12 +110,13 @@ impl AccountStore {
     }
 
     fn load_from(path: PathBuf) -> AccountStore {
-        let mut store = AccountStore { path, accounts: Vec::new() };
+        let mut store = AccountStore { path, accounts: Vec::new(), removed_ids: Vec::new() };
         let Ok(bytes) = std::fs::read(&store.path) else {
             return store;
         };
         match serde_json::from_slice::<StoreFileFormat>(&bytes) {
             Ok(file) => {
+                store.removed_ids = file.removed_ids;
                 store.accounts = file
                     .accounts
                     .into_iter()
@@ -130,7 +139,15 @@ impl AccountStore {
                     .collect();
             }
             Err(_) => {
-                let bad = store.path.with_extension("json.bad");
+                // Quarantine to the first free numbered name: Windows rename
+                // replaces existing files, and overwriting an earlier .bad
+                // would silently destroy previously quarantined tokens.
+                let mut bad = store.path.with_extension("json.bad");
+                let mut n = 1;
+                while bad.exists() && n <= 100 {
+                    bad = store.path.with_extension(format!("json.bad.{n}"));
+                    n += 1;
+                }
                 let _ = std::fs::rename(&store.path, bad);
             }
         }
@@ -145,6 +162,7 @@ impl AccountStore {
         }
         let on_disk = StoreFileFormat {
             version: STORE_VERSION,
+            removed_ids: self.removed_ids.clone(),
             accounts: self
                 .accounts
                 .iter()
@@ -201,6 +219,9 @@ impl AccountStore {
         log_name: Option<String>,
     ) -> UpsertOutcome {
         let now = now_secs();
+        // Saving an account is an explicit decision to keep it — lift any
+        // removal tombstone.
+        self.removed_ids.retain(|id| !id.eq_ignore_ascii_case(account_id));
         if let Some(existing) = self
             .accounts
             .iter_mut()
@@ -236,7 +257,21 @@ impl AccountStore {
         let before = self.accounts.len();
         self.accounts
             .retain(|a| !a.account_id.eq_ignore_ascii_case(account_id));
-        self.accounts.len() != before
+        let removed = self.accounts.len() != before;
+        // Tombstone: the switch's outgoing auto-save must not silently
+        // re-capture a token the user explicitly deleted.
+        if removed && !self.is_removed(account_id) {
+            self.removed_ids.push(account_id.to_lowercase());
+        }
+        removed
+    }
+
+    /// Whether this account was explicitly removed by the user (and not
+    /// re-saved since). Consulted by the switch's outgoing auto-save.
+    pub fn is_removed(&self, account_id: &str) -> bool {
+        self.removed_ids
+            .iter()
+            .any(|id| id.eq_ignore_ascii_case(account_id))
     }
 
     pub fn touch_last_used(&mut self, account_id: &str) {
@@ -246,6 +281,27 @@ impl AccountStore {
             .find(|a| a.account_id.eq_ignore_ascii_case(account_id))
         {
             account.last_used = Some(now_secs());
+        }
+    }
+
+    /// Best-effort upgrade of a saved account's display name from a name that
+    /// was already resolved for THIS account (looked up by its own ID). A
+    /// `None` name is a no-op, so an existing name is never cleared, and a
+    /// user rename (`display_name_is_custom`) is never overwritten. Unlike
+    /// `upsert_session` it touches neither the token nor `saved_at` — the
+    /// switch uses it to keep the target's name fresh without re-capturing.
+    pub fn refresh_log_name(&mut self, account_id: &str, log_name: Option<String>) {
+        let Some(name) = log_name else {
+            return;
+        };
+        if let Some(account) = self
+            .accounts
+            .iter_mut()
+            .find(|a| a.account_id.eq_ignore_ascii_case(account_id))
+        {
+            if !account.display_name_is_custom {
+                account.display_name = name;
+            }
         }
     }
 
@@ -475,6 +531,34 @@ mod tests {
     }
 
     #[test]
+    fn refresh_log_name_upgrades_only_non_custom() {
+        let (_dir, mut store) = temp_store();
+        store.upsert_session("abc", "one".into(), None);
+        assert_eq!(store.get("abc").unwrap().display_name, "Account abc");
+
+        // A `None` name never clears the existing name.
+        store.refresh_log_name("abc", None);
+        assert_eq!(store.get("abc").unwrap().display_name, "Account abc");
+
+        // A found name upgrades a generated one (case-insensitive id match)
+        // without touching the token or `saved_at`.
+        let saved_at = store.get("abc").unwrap().saved_at;
+        store.refresh_log_name("ABC", Some("RealName".into()));
+        assert_eq!(store.get("abc").unwrap().display_name, "RealName");
+        assert_eq!(store.get("abc").unwrap().remember_me_data, "one");
+        assert_eq!(store.get("abc").unwrap().saved_at, saved_at);
+
+        // A user rename is never overwritten.
+        store.accounts[0].display_name = "MyName".into();
+        store.accounts[0].display_name_is_custom = true;
+        store.refresh_log_name("abc", Some("LogName".into()));
+        assert_eq!(store.get("abc").unwrap().display_name, "MyName");
+
+        // An unknown account is a silent no-op.
+        store.refresh_log_name("zzz", Some("X".into()));
+    }
+
+    #[test]
     fn remove_deletes_by_id() {
         let (_dir, mut store) = temp_store();
         store.upsert_session("abc", "one".into(), None);
@@ -482,6 +566,23 @@ mod tests {
         assert!(store.remove("ABC"));
         assert!(!store.remove("abc"));
         assert_eq!(store.accounts().len(), 1);
+    }
+
+    #[test]
+    fn remove_tombstones_until_resaved() {
+        let (dir, mut store) = temp_store();
+        store.upsert_session("abc", "one".into(), None);
+        store.remove("ABC");
+        assert!(store.is_removed("abc"), "tombstone is case-insensitive");
+        store.save().expect("save");
+
+        // The tombstone survives a reload.
+        let mut reloaded = AccountStore::load_from(dir.path().join(STORE_FILE));
+        assert!(reloaded.is_removed("Abc"));
+
+        // An explicit re-save lifts it.
+        reloaded.upsert_session("abc", "fresh".into(), None);
+        assert!(!reloaded.is_removed("abc"));
     }
 
     #[test]
@@ -493,6 +594,22 @@ mod tests {
         assert!(store.accounts().is_empty());
         assert!(!path.exists());
         assert!(dir.path().join("accounts.json.bad").exists());
+    }
+
+    #[test]
+    fn second_corruption_keeps_earlier_quarantine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(STORE_FILE);
+        std::fs::write(&path, b"{ first corruption").expect("write");
+        let _ = AccountStore::load_from(path.clone());
+        std::fs::write(&path, b"{ second corruption").expect("write");
+        let _ = AccountStore::load_from(path.clone());
+
+        let first = std::fs::read_to_string(dir.path().join("accounts.json.bad")).expect("bad");
+        let second =
+            std::fs::read_to_string(dir.path().join("accounts.json.bad.1")).expect("bad.1");
+        assert_eq!(first, "{ first corruption", "earlier quarantine must survive");
+        assert_eq!(second, "{ second corruption");
     }
 
     #[test]

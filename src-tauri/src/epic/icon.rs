@@ -20,15 +20,36 @@ const PALETTE: [[u8; 3]; 9] = [
     [0x64, 0x74, 0x8B], // slate
 ];
 
-/// The character shown on the badge: the first alphanumeric of the display
-/// name, else of the account ID, else 'E'.
+/// The character shown on the badge: the first glyph-mappable character of
+/// the display name, else of the account ID, else 'E'. Common accented Latin
+/// letters are transliterated (Ü -> U, é -> E, …) because the embedded font
+/// only covers A-Z/0-9 — without this, umlaut names would render the '?'
+/// fallback glyph.
 pub fn initial_for(display_name: &str, account_id: &str) -> char {
     display_name
         .chars()
-        .find(|c| c.is_alphanumeric())
-        .or_else(|| account_id.chars().find(|c| c.is_alphanumeric()))
-        .map(|c| c.to_ascii_uppercase())
+        .find_map(mappable_initial)
+        .or_else(|| account_id.chars().find_map(mappable_initial))
         .unwrap_or('E')
+}
+
+/// Map a character to a glyph the embedded font can draw, if possible.
+fn mappable_initial(c: char) -> Option<char> {
+    if c.is_ascii_alphanumeric() {
+        return Some(c.to_ascii_uppercase());
+    }
+    match c {
+        'Ä' | 'ä' | 'À' | 'à' | 'Á' | 'á' | 'Â' | 'â' | 'Ã' | 'ã' | 'Å' | 'å' => Some('A'),
+        'É' | 'é' | 'È' | 'è' | 'Ê' | 'ê' | 'Ë' | 'ë' => Some('E'),
+        'Í' | 'í' | 'Ì' | 'ì' | 'Î' | 'î' | 'Ï' | 'ï' => Some('I'),
+        'Ö' | 'ö' | 'Ò' | 'ò' | 'Ó' | 'ó' | 'Ô' | 'ô' | 'Õ' | 'õ' | 'Ø' | 'ø' => Some('O'),
+        'Ü' | 'ü' | 'Ù' | 'ù' | 'Ú' | 'ú' | 'Û' | 'û' => Some('U'),
+        'Ç' | 'ç' => Some('C'),
+        'Ñ' | 'ñ' => Some('N'),
+        'Ý' | 'ý' | 'Ÿ' | 'ÿ' => Some('Y'),
+        'ß' => Some('S'),
+        _ => None,
+    }
 }
 
 /// Render a `size`×`size` RGBA initials badge. Returns `(rgba_bytes, size)`.
@@ -177,6 +198,16 @@ mod tests {
         assert_eq!(initial_for("  •weird", "12ab"), 'W');
         assert_eq!(initial_for("---", "12ab"), '1');
         assert_eq!(initial_for("", ""), 'E');
+    }
+
+    #[test]
+    fn accented_initials_are_transliterated() {
+        assert_eq!(initial_for("Ümläut", "12ab"), 'U');
+        assert_eq!(initial_for("Ödipus", "12ab"), 'O');
+        assert_eq!(initial_for("Ärger", "12ab"), 'A');
+        assert_eq!(initial_for("électro", "12ab"), 'E');
+        // Unmappable scripts fall through to the account id.
+        assert_eq!(initial_for("日本語", "9xyz"), '9');
     }
 
     #[test]
