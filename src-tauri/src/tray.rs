@@ -2,7 +2,7 @@
 //! (with generated initials badges), a "save current account" action, account
 //! removal, and settings; the tray icon shows the active account's badge.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tauri::{
@@ -28,6 +28,42 @@ const STALE_CHECK_DELAY: Duration = Duration::from_secs(20);
 /// newer switch has started, so it can never blame a superseded account.
 static SWITCH_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// True while a switch is in flight. Further switch clicks are ignored until
+/// it completes — a second click would otherwise queue a full second
+/// kill/relaunch cycle behind the store lock (launcher dies twice in a row).
+static SWITCH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Set when the user clicked Quit. The auto-updater checks it after acquiring
+/// the busy lock so a quit cannot morph into an update-install-and-restart.
+pub(crate) static QUITTING: AtomicBool = AtomicBool::new(false);
+
+/// Releases [`SWITCH_IN_PROGRESS`] on drop, so the flag can never leak (and
+/// permanently block switching) if the switch thread panics.
+struct SwitchInProgressGuard;
+
+impl Drop for SwitchInProgressGuard {
+    fn drop(&mut self) {
+        SWITCH_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Localized dialog body for a failed switch; technical detail appended.
+fn switch_error_message(l: &i18n::Labels, error: &switch::SwitchError) -> String {
+    use switch::SwitchError::*;
+    match error {
+        AccountMissing => l.err_account_missing.to_string(),
+        SnapshotInvalid => l.err_snapshot_invalid.to_string(),
+        SnapshotStale => l.err_snapshot_stale.to_string(),
+        LauncherNotFound => l.err_launcher_not_found.to_string(),
+        ConfigNotFound => l.err_no_launcher_data.to_string(),
+        CheckFailed(detail) => format!("{}\n\n{detail}", l.err_check_failed),
+        KillTimeout => l.err_kill_timeout.to_string(),
+        StoreSave(detail) => format!("{}\n\n{detail}", l.err_store_write),
+        IniWrite(detail) => format!("{}\n\n{detail}", l.err_ini_write),
+        Relaunch(detail) => format!("{}\n\n{detail}", l.err_relaunch),
+    }
+}
+
 /// Display name: Epic username or short account ID, per the user's setting.
 fn display_name(app: &AppHandle, account: &Account) -> String {
     if settings::name_mode(app) == "id" {
@@ -39,8 +75,12 @@ fn display_name(app: &AppHandle, account: &Account) -> String {
     account.display_name.clone()
 }
 
-fn menu_icon(account: &Account) -> Image<'static> {
-    let initial = icon::initial_for(&account.display_name, &account.account_id);
+/// Badge icon for a menu entry. The initial is derived from the same string
+/// the label shows, so "Account ID" mode (privacy) never leaks the first
+/// letter of the Epic username through the badge.
+fn menu_icon(app: &AppHandle, account: &Account) -> Image<'static> {
+    let label = display_name(app, account);
+    let initial = icon::initial_for(&label, &account.account_id);
     let (rgba, size) = icon::badge_rgba(&account.account_id, initial, MENU_ICON_SIZE);
     Image::new_owned(rgba, size, size)
 }
@@ -72,7 +112,7 @@ fn build_menu(app: &AppHandle, accounts: &[Account]) -> tauri::Result<Menu<Wry>>
                 format!("switch:{}", account.account_id),
                 label.as_str(),
                 !account.is_current,
-                Some(menu_icon(account)),
+                Some(menu_icon(app, account)),
                 None::<&str>,
             )?;
             menu.append(&item)?;
@@ -159,14 +199,14 @@ fn refresh_icon(app: &AppHandle, accounts: &[Account]) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
-    let current = accounts
-        .iter()
-        .find(|a| a.is_current)
-        .or_else(|| accounts.first());
-    match current {
+    // Only a genuinely ACTIVE account gets its badge on the tray. When nobody
+    // is logged in, the default app icon is shown instead — a last-used badge
+    // would be indistinguishable from "logged in as this account".
+    match accounts.iter().find(|a| a.is_current) {
         Some(account) => {
-            let _ = tray.set_tooltip(Some(display_name(app, account)));
-            let initial = icon::initial_for(&account.display_name, &account.account_id);
+            let label = display_name(app, account);
+            let initial = icon::initial_for(&label, &account.account_id);
+            let _ = tray.set_tooltip(Some(label));
             let (rgba, size) = icon::badge_rgba(&account.account_id, initial, TRAY_ICON_SIZE);
             let _ = tray.set_icon(Some(Image::new_owned(rgba, size, size)));
         }
@@ -239,10 +279,28 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         } else {
             manager.enable()
         };
-        let _ = result;
+        // A silent failure would just look like a checkmark refusing to move.
+        if result.is_err() {
+            let l = i18n::labels(&settings::language(app));
+            show_error(l.autostart, l.autostart_failed);
+        }
+        // The user is now managing autostart explicitly — the first-run
+        // default must never override this choice on a later start.
+        settings::mark_autostart_configured(app);
         refresh(app);
     } else if id == "quit" {
-        app.exit(0);
+        // Exit only once no switch/store operation is in flight: quitting
+        // between the launcher kill and the relaunch would leave the launcher
+        // dead and the outgoing token unsaved. The lock is taken on a worker
+        // thread so a pending switch does not freeze the tray while quitting.
+        // QUITTING additionally stops the auto-updater from turning this quit
+        // into an update-install-and-restart if it wins the lock race.
+        QUITTING.store(true, Ordering::SeqCst);
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let _guard = store::lock();
+            app.exit(0);
+        });
     }
 }
 
@@ -251,24 +309,59 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 fn switch_to(app: &AppHandle, account_id: String) {
     let accounts = epic::list_accounts(app).unwrap_or_default();
     let Some(account) = accounts.into_iter().find(|a| a.account_id == account_id) else {
+        // Stale menu entry (account was removed meanwhile): never a silent
+        // no-op — say so and rebuild the menu.
+        let l = i18n::labels(&settings::language(app));
+        show_error(l.switch_failed, l.err_account_missing);
+        refresh(app);
         return;
     };
-    // Claim a generation so a later switch supersedes this one's stale check.
-    let generation = SWITCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    // One switch at a time: a second full kill/relaunch cycle would otherwise
+    // queue up behind the store lock. Not silent — the user gets told.
+    if SWITCH_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        let l = i18n::labels(&settings::language(app));
+        show_info("Epic Quick Switch", l.switch_busy);
+        return;
+    }
     let app = app.clone();
     std::thread::spawn(move || {
         let l = i18n::labels(&settings::language(&app));
         // Never fail silently: switching is the app's primary action, so
         // surface any error in a native dialog instead of leaving the user
         // guessing.
-        if let Err(message) = switch::switch_account(&app, &account.account_id) {
-            show_error(l.switch_failed, &message);
+        // Guard released as soon as the switch itself finishes (also on
+        // panic) — it must NOT stay held through the 20s stale check below.
+        let guard = SwitchInProgressGuard;
+        let result = switch::switch_account(&app, &account.account_id);
+        // Only a REAL switch claims a generation: preflight failures and
+        // already-active no-ops must not cancel a previous switch's pending
+        // check. Claimed BEFORE the guard drops, so two back-to-back switches
+        // can never claim generations out of order.
+        let generation = match &result {
+            Ok(switch::SwitchOutcome::Switched) => {
+                Some(SWITCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1)
+            }
+            _ => None,
+        };
+        drop(guard);
+        if let Err(error) = result {
+            show_error(l.switch_failed, &switch_error_message(&l, &error));
             let handle = app.clone();
             let _ = app.run_on_main_thread(move || refresh(&handle));
             return;
         }
         let handle = app.clone();
         let _ = app.run_on_main_thread(move || refresh(&handle));
+
+        // Only a REAL switch schedules the rejection check — probing an
+        // untouched session after a no-op would misread a manual logout as an
+        // expired token.
+        let Some(generation) = generation else {
+            return;
+        };
 
         // The token blob is opaque, so an expired session can only be seen
         // after the launcher tried it: if it logs the user out again, mark
@@ -308,7 +401,10 @@ fn save_current_clicked(app: &AppHandle) {
                     switch::SaveError::NoLauncherData => l.err_no_launcher_data.to_string(),
                     switch::SaveError::NoSession => l.err_no_session.to_string(),
                     switch::SaveError::NoAccountId => l.err_no_account_id.to_string(),
-                    switch::SaveError::Store(message) => message,
+                    // Localized headline, technical reason as detail line.
+                    switch::SaveError::Store(detail) => {
+                        format!("{}\n\n{detail}", l.err_store_write)
+                    }
                 };
                 show_error(l.save_failed, &message);
             }
@@ -323,6 +419,11 @@ fn save_current_clicked(app: &AppHandle) {
 fn remove_clicked(app: &AppHandle, account_id: String) {
     let accounts = epic::list_accounts(app).unwrap_or_default();
     let Some(account) = accounts.into_iter().find(|a| a.account_id == account_id) else {
+        // Stale menu entry (already removed): give feedback and heal the menu
+        // instead of silently doing nothing.
+        let l = i18n::labels(&settings::language(app));
+        show_error(l.remove_account, l.err_account_missing);
+        refresh(app);
         return;
     };
     let name = display_name(app, &account);
@@ -365,6 +466,10 @@ const MB_OK: u32 = 0x0000_0000;
 const MB_YESNO: u32 = 0x0000_0004;
 const MB_ICONERROR: u32 = 0x0000_0010;
 const MB_ICONQUESTION: u32 = 0x0000_0020;
+const MB_ICONINFORMATION: u32 = 0x0000_0040;
+/// Second button (No) is the default — a stray Enter must not confirm a
+/// destructive action.
+const MB_DEFBUTTON2: u32 = 0x0000_0100;
 const MB_SETFOREGROUND: u32 = 0x0001_0000;
 const IDYES: i32 = 6;
 
@@ -385,7 +490,23 @@ fn show_error(title: &str, message: &str) {
     }
 }
 
-/// Native yes/no confirmation; `true` when the user picked Yes.
+/// Native informational dialog (e.g. "already running" on a second launch).
+pub(crate) fn show_info(title: &str, message: &str) {
+    let text = wide(message);
+    let caption = wide(title);
+    // SAFETY: see show_error.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+        );
+    }
+}
+
+/// Native yes/no confirmation; `true` when the user picked Yes. `No` is the
+/// default button: these confirms guard destructive actions.
 fn confirm(title: &str, message: &str) -> bool {
     let text = wide(message);
     let caption = wide(title);
@@ -395,7 +516,7 @@ fn confirm(title: &str, message: &str) -> bool {
             std::ptr::null_mut(),
             text.as_ptr(),
             caption.as_ptr(),
-            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND,
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND,
         )
     };
     choice == IDYES

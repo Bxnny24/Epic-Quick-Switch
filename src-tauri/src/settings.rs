@@ -52,14 +52,25 @@ pub fn set_name_mode(app: &AppHandle, mode: &str) {
 }
 
 /// On first run, enable "start with Windows" by default (once). If the user
-/// later turns it off, it is not re-enabled.
+/// later turns it off, it is not re-enabled. The configured flag is only set
+/// once enabling actually succeeded — otherwise the default would silently
+/// never apply (and never be retried on later starts).
 pub fn ensure_autostart_default(app: &AppHandle) {
     if let Ok(store) = app.store(STORE) {
-        if store.get("autostartConfigured").is_none() {
-            let _ = app.autolaunch().enable();
+        if store.get("autostartConfigured").is_none() && app.autolaunch().enable().is_ok() {
             store.set("autostartConfigured", json!(true));
             let _ = store.save();
         }
+    }
+}
+
+/// Record that autostart has been explicitly configured (first-run default or
+/// a manual toggle). Once set, `ensure_autostart_default` never interferes
+/// again — the user's choice must not be overridden by a later retry.
+pub fn mark_autostart_configured(app: &AppHandle) {
+    if let Ok(store) = app.store(STORE) {
+        store.set("autostartConfigured", json!(true));
+        let _ = store.save();
     }
 }
 

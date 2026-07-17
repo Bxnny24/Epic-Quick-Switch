@@ -17,22 +17,6 @@ pub struct LogIdentity {
     pub username: String,
 }
 
-/// The most recent identity in the launcher logs, if any game launch was
-/// logged. Scans newest log first; within a file the last match wins.
-pub fn latest_identity() -> Option<LogIdentity> {
-    let dir = paths::logs_dir()?;
-    for file in log_files_newest_first(&dir) {
-        let Ok(bytes) = std::fs::read(&file) else {
-            continue;
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        if let Some(identity) = text.lines().rev().find_map(extract_identity) {
-            return Some(identity);
-        }
-    }
-    None
-}
-
 /// The username logged for a specific account ID, newest occurrence first.
 pub fn username_for(account_id: &str) -> Option<String> {
     let dir = paths::logs_dir()?;
@@ -167,13 +151,5 @@ mod tests {
             .open(path)
             .expect("open for mtime");
         file.set_modified(time).expect("set mtime");
-    }
-
-    /// Smoke test against the real machine. Ignored by default (needs Epic).
-    /// Run with: cargo test -- --ignored --nocapture print_log_identity
-    #[test]
-    #[ignore]
-    fn print_log_identity() {
-        println!("latest identity: {:?}", latest_identity());
     }
 }
