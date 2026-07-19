@@ -36,6 +36,7 @@ pub struct Labels {
     pub autostart_failed: &'static str,
     pub already_running: &'static str,
     pub switch_busy: &'static str,
+    pub auto_capture: &'static str,
 }
 
 /// Substitute `{name}` in a template label.
@@ -79,6 +80,7 @@ pub fn labels(lang: &str) -> Labels {
             autostart_failed: "Die Autostart-Einstellung konnte nicht ge\u{e4}ndert werden.",
             already_running: "Epic Quick Switch l\u{e4}uft bereits im Infobereich.",
             switch_busy: "Ein Kontowechsel l\u{e4}uft bereits. Bitte warten, bis er abgeschlossen ist.",
+            auto_capture: "Konten automatisch speichern",
         }
     } else {
         Labels {
@@ -115,6 +117,7 @@ pub fn labels(lang: &str) -> Labels {
             autostart_failed: "Couldn't change the autostart setting.",
             already_running: "Epic Quick Switch is already running in the system tray.",
             switch_busy: "An account switch is already in progress. Please wait for it to finish.",
+            auto_capture: "Save accounts automatically",
         }
     }
 }
