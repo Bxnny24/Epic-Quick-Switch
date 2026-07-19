@@ -51,6 +51,27 @@ pub fn set_name_mode(app: &AppHandle, mode: &str) {
     }
 }
 
+/// Whether new logins detected by the session watcher are saved into the
+/// switcher automatically. Defaults to on; explicit removals stay removed
+/// regardless (tombstones in the account store).
+pub fn auto_capture(app: &AppHandle) -> bool {
+    if let Ok(store) = app.store(STORE) {
+        if let Some(value) = store.get("autoCapture") {
+            if let Some(b) = value.as_bool() {
+                return b;
+            }
+        }
+    }
+    true
+}
+
+pub fn set_auto_capture(app: &AppHandle, on: bool) {
+    if let Ok(store) = app.store(STORE) {
+        store.set("autoCapture", json!(on));
+        let _ = store.save();
+    }
+}
+
 /// On first run, enable "start with Windows" by default (once). If the user
 /// later turns it off, it is not re-enabled. The configured flag is only set
 /// once enabling actually succeeded — otherwise the default would silently

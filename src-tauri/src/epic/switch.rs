@@ -143,6 +143,66 @@ pub fn save_current(app: &AppHandle) -> Result<SavedAccount, SaveError> {
     Ok(SavedAccount { account_id, display_name })
 }
 
+/// Silent best-effort capture of the current session for the tray's session
+/// watcher: whoever is logged in gets saved/refreshed without any dialogs.
+/// Returns `true` when the store changed (the caller refreshes the tray).
+///
+/// The caller must only invoke this on a QUIET watcher tick (no watch-key
+/// change for a full interval): the registry AccountId survives a logout, so
+/// sampling mid-login-sequence could file the new account's token under the
+/// previous account's id. A quiet tick proves ini and registry were stable.
+///
+/// Note: the upsert bumps `saved_at`, which orders never-switched accounts in
+/// the menu — benign (identical to a manual save), and the identical-token
+/// skip below prevents gratuitous bumps.
+pub fn auto_capture(app: &AppHandle) -> bool {
+    // Same lock as switching/saving: a capture can never observe a switch's
+    // intermediate ini/registry state.
+    let _guard = store::lock();
+
+    let Ok(location) = paths::resolve_ini() else {
+        return false;
+    };
+    let Ok(file) = ini::load(&location.primary) else {
+        return false;
+    };
+    // One ini read decides validity AND supplies the token (no re-read gap).
+    // Logout placeholders and rejected sessions fail is_valid() here.
+    let Some(remember) = ini::read_remember_me(&file) else {
+        return false;
+    };
+    if !remember.is_valid() {
+        return false;
+    }
+    let data = remember.data.expect("validated above");
+
+    // Identity comes from the registry only — fail closed, like save_current.
+    let Some(account_id) = registry::account_id() else {
+        return false;
+    };
+
+    let mut store = store::AccountStore::load(app);
+    // Explicitly removed accounts stay removed until a MANUAL save: the check
+    // must precede upsert_session, which lifts tombstones.
+    if store.is_removed(&account_id) {
+        return false;
+    }
+    // Unchanged token: nothing to do. Must also precede the upsert (it would
+    // bump saved_at and clear stale even for identical data), and keeps disk
+    // writes rare despite the launcher's frequent ini touches.
+    if store
+        .get(&account_id)
+        .is_some_and(|a| a.remember_me_data == data)
+    {
+        return false;
+    }
+
+    // Only now the expensive step (scanning launcher logs for the username).
+    let log_name = logs::username_for(&account_id);
+    store.upsert_session(&account_id, data, log_name);
+    store.save().is_ok()
+}
+
 /// Switch the live Epic session to the saved account `account_id`.
 pub fn switch_account(app: &AppHandle, account_id: &str) -> Result<SwitchOutcome, SwitchError> {
     // Serialize the whole switch: this prevents two interleaved kill/relaunch
