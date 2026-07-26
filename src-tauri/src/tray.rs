@@ -170,10 +170,20 @@ fn build_menu(app: &AppHandle, accounts: &[Account]) -> tauri::Result<Menu<Wry>>
     let autostart =
         CheckMenuItem::with_id(app, "autostart", l.autostart, true, autostart_on, None::<&str>)?;
 
+    let auto_capture = CheckMenuItem::with_id(
+        app,
+        "autocapture",
+        l.auto_capture,
+        true,
+        settings::auto_capture(app),
+        None::<&str>,
+    )?;
+
     let settings_menu = SubmenuBuilder::new(app, l.settings)
         .item(&lang_menu)
         .item(&name_menu)
         .item(&autostart)
+        .item(&auto_capture)
         .build()?;
     menu.append(&settings_menu)?;
 
@@ -236,18 +246,39 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 }
 
 /// Watch for session changes made outside this app (logins, logouts or
-/// switches in the launcher itself) and refresh the tray on change.
+/// switches in the launcher itself), refresh the tray on change, and — one
+/// QUIET tick later — auto-capture the session into the store (if enabled).
+///
+/// The capture is debounced to the first tick WITHOUT a key change: the
+/// registry AccountId survives a logout, so sampling mid-login ("logout X,
+/// log in as Y") could file Y's token under X's id. A quiet tick proves ini
+/// and registry were stable for a full interval, i.e. the login settled.
 fn start_session_watcher(app: &AppHandle) {
     let app = app.clone();
     std::thread::spawn(move || {
         let mut last = epic::accounts::watch_key();
+        let mut capture_pending = false;
         loop {
             std::thread::sleep(WATCH_INTERVAL);
             let now = epic::accounts::watch_key();
             if now != last {
                 last = now;
+                capture_pending = true;
                 let handle = app.clone();
                 let _ = app.run_on_main_thread(move || refresh(&handle));
+            } else if capture_pending {
+                // Keep the capture pending while a switch is in flight — the
+                // switch's own ini/registry writes would re-arm it anyway.
+                if SWITCH_IN_PROGRESS.load(Ordering::SeqCst) {
+                    continue;
+                }
+                capture_pending = false;
+                if settings::auto_capture(&app) && switch::auto_capture(&app) {
+                    // The store changed on a quiet tick, so no key change will
+                    // trigger the refresh that shows the new entry — do it.
+                    let handle = app.clone();
+                    let _ = app.run_on_main_thread(move || refresh(&handle));
+                }
             }
         }
     });
@@ -287,6 +318,9 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         // The user is now managing autostart explicitly — the first-run
         // default must never override this choice on a later start.
         settings::mark_autostart_configured(app);
+        refresh(app);
+    } else if id == "autocapture" {
+        settings::set_auto_capture(app, !settings::auto_capture(app));
         refresh(app);
     } else if id == "quit" {
         // Exit only once no switch/store operation is in flight: quitting
@@ -374,6 +408,13 @@ fn switch_to(app: &AppHandle, account_id: String) {
         if switch::session_rejected(&account.account_id) {
             {
                 let _guard = store::lock();
+                // Re-check under the lock: a fresh login (auto-capture or
+                // manual save) may have landed between the probe above and
+                // acquiring the lock — a healthy new snapshot must not be
+                // marked stale.
+                if !switch::session_rejected(&account.account_id) {
+                    return;
+                }
                 let mut store = store::AccountStore::load(&app);
                 store.mark_stale(&account.account_id);
                 let _ = store.save();
