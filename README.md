@@ -5,10 +5,10 @@
 *Switch between your Epic Games accounts straight from the system tray — one click, no retyping passwords.*
 
 <!-- BEGIN LATEST DOWNLOAD BUTTON -->
-[![Download](https://img.shields.io/badge/Download-Epic_Quick_Switch_0.1.0-7c3aed?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Bxnny24/Epic-Quick-Switch/releases/latest/download/EpicQuickSwitch-Setup.exe)
+[![Download](https://img.shields.io/badge/Download-Epic_Quick_Switch_0.2.0-7c3aed?style=for-the-badge&logo=windows&logoColor=white)](https://github.com/Bxnny24/Epic-Quick-Switch/releases/latest/download/EpicQuickSwitch-Setup.exe)
 
 ![Platform](https://img.shields.io/badge/platform-Windows_10%2F11-lightgrey?style=flat-square&logo=windows)
-![Version](https://img.shields.io/badge/version-0.1.0-7c3aed?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.2.0-7c3aed?style=flat-square)
 <!-- END LATEST DOWNLOAD BUTTON -->
 
 </div>
