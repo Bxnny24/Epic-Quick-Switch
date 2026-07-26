@@ -40,6 +40,16 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Read release notes
+        id: notes
+        shell: pwsh
+        run: |
+          $body = Get-Content .github/release-notes.md -Raw
+          $delim = "EOF_RELEASE_NOTES"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "body<<$delim" -Encoding utf8
+          Add-Content -Path $env:GITHUB_OUTPUT -Value $body -Encoding utf8
+          Add-Content -Path $env:GITHUB_OUTPUT -Value $delim -Encoding utf8
+
       - name: Build, sign and publish release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -49,7 +59,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "${{ github.ref_name }}"
-          releaseBody: "Download the installer below. The app updates itself automatically afterwards."
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false
 
