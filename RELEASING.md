@@ -54,8 +54,8 @@ git push origin v0.1.0
 
 The **Release** workflow writes the version (from the tag) into
 `tauri.conf.json`, `package.json` and `Cargo.toml`, builds the Windows installer
-(NSIS + MSI), signs the update artifacts, and publishes a GitHub Release with the
-installers and `latest.json`. A follow-up job also uploads the NSIS installer
+(NSIS), signs the update artifacts, and publishes a GitHub Release with the
+installer and `latest.json`. A follow-up job also uploads the NSIS installer
 under the stable name `EpicQuickSwitch-Setup.exe` and updates the README
 download badge.
 
