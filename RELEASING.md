@@ -59,6 +59,14 @@ installers and `latest.json`. A follow-up job also uploads the NSIS installer
 under the stable name `EpicQuickSwitch-Setup.exe` and updates the README
 download badge.
 
+## Release description
+
+The body of every GitHub Release is the contents of
+[`.github/release-notes.md`](.github/release-notes.md) — a bulleted list of all
+app features. It is not generated, so keep it up to date: whenever a change adds
+or alters a user-facing feature, edit that file in the same PR. The workflow
+reads it at build time, so what ships is whatever sits on the tagged commit.
+
 > The tag (e.g. `v0.1.1`) must be a **higher** version than what users have
 > installed, otherwise the updater sees no newer version and does nothing.
 
