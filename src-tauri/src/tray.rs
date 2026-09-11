@@ -21,6 +21,10 @@ const TRAY_ICON_SIZE: u32 = 32;
 const MENU_ICON_SIZE: u32 = 18;
 /// How often to poll for session changes made outside this app.
 const WATCH_INTERVAL: Duration = Duration::from_secs(3);
+/// How often, and how many times, to confirm after startup that the tray icon
+/// really reached the notification area (see `start_registration_guard`).
+const REGISTRATION_CHECKS: u32 = 5;
+const REGISTRATION_INTERVAL: Duration = Duration::from_secs(12);
 /// How long after a switch to check whether Epic accepted the restored token.
 const STALE_CHECK_DELAY: Duration = Duration::from_secs(20);
 
@@ -229,8 +233,9 @@ fn refresh_icon(app: &AppHandle, accounts: &[Account]) {
     }
 }
 
-/// Create the tray icon and menu on startup.
-pub fn setup(app: &AppHandle) -> tauri::Result<()> {
+/// Create the tray icon and menu. Split out of [`setup`] because
+/// [`start_registration_guard`] may have to build the icon a second time.
+fn create_tray(app: &AppHandle) -> tauri::Result<()> {
     let accounts = epic::list_accounts(app).unwrap_or_default();
     let menu = build_menu(app, &accounts)?;
     TrayIconBuilder::with_id(TRAY_ID)
@@ -241,8 +246,59 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| handle_menu_event(app, event.id().as_ref()))
         .build(app)?;
     refresh_icon(app, &accounts);
-    start_session_watcher(app);
     Ok(())
+}
+
+/// Create the tray icon and menu on startup.
+pub fn setup(app: &AppHandle) -> tauri::Result<()> {
+    create_tray(app)?;
+    start_session_watcher(app);
+    start_registration_guard(app);
+    Ok(())
+}
+
+/// Confirm the tray icon actually landed in the notification area, and rebuild
+/// it if it did not.
+///
+/// Windows is allowed to reject `Shell_NotifyIcon(NIM_ADD)` while the shell is
+/// still coming up at logon — precisely when this app starts, since it is
+/// registered for autostart. `tray-icon` swallows that failure (its error
+/// branch is an empty `if` block), so `TrayIconBuilder::build` still returns
+/// `Ok`: the app runs on with a working menu, watcher and switching, but with
+/// no icon in the tray. It only re-registers on a `TaskbarCreated` broadcast,
+/// which Windows sends when the taskbar is *created* — so if Explorer was
+/// already running that broadcast is in the past and never arrives again, and
+/// the icon stays missing for the whole process lifetime.
+///
+/// `rect()` is backed by `Shell_NotifyIconGetRect`, which fails for an icon the
+/// shell does not know about. It can also fail for a merely hidden icon on some
+/// Windows versions, so rebuilding is not free of false positives: it can cost
+/// the user’s “always show this icon” placement. Hence the hard attempt
+/// limit and the stop on first success — at worst a couple of re-adds in the
+/// first minute, never a loop.
+fn start_registration_guard(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        for _ in 0..REGISTRATION_CHECKS {
+            std::thread::sleep(REGISTRATION_INTERVAL);
+            let registered = app
+                .tray_by_id(TRAY_ID)
+                .and_then(|tray| tray.rect().ok().flatten())
+                .is_some();
+            if registered {
+                return;
+            }
+            // Building a tray icon creates a window, so it belongs on the main
+            // thread — the same reason `refresh` is dispatched there.
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                // Dropping the removed icon is what unregisters it, so the
+                // stale entry cannot survive alongside the new one.
+                let _ = handle.remove_tray_by_id(TRAY_ID);
+                let _ = create_tray(&handle);
+            });
+        }
+    });
 }
 
 /// Watch for session changes made outside this app (logins, logouts or
