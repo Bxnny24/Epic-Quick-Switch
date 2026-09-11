@@ -85,11 +85,50 @@ fn menu_icon(app: &AppHandle, account: &Account) -> Image<'static> {
     Image::new_owned(rgba, size, size)
 }
 
+/// Order accounts for the menu, per the user's sort setting.
+///
+/// "recent" keeps the order `list_accounts` produced — active account pinned
+/// first, then most-recently-used. "name" is an explicit alphabetical choice,
+/// so the active account sorts in with the rest: pinning it would move a name
+/// away from the letter the user is scanning for.
+fn sorted_accounts<'a>(app: &AppHandle, accounts: &'a [Account]) -> Vec<&'a Account> {
+    let mut ordered: Vec<&Account> = accounts.iter().collect();
+    if settings::sort_mode(app) == "name" {
+        // Sort by what the menu actually shows, so the order always matches
+        // the visible labels under either display-name mode. The sort is
+        // stable, so accounts sharing a name keep their most-recent-first order.
+        ordered.sort_by_cached_key(|a| sort_key(&display_name(app, a)));
+    }
+    ordered
+}
+
+/// Case-insensitive sort key. German umlauts fold to their base letter so
+/// "Ärger" sorts under A instead of after Z — the app ships English and
+/// German, and raw code-point order would push every umlaut to the end.
+fn sort_key(name: &str) -> String {
+    let mut key = String::with_capacity(name.len());
+    for ch in name.to_lowercase().chars() {
+        match ch {
+            'ä' => key.push('a'),
+            'ö' => key.push('o'),
+            'ü' => key.push('u'),
+            'ß' => key.push_str("ss"),
+            _ => key.push(ch),
+        }
+    }
+    key
+}
+
 /// Build the full tray menu from the saved accounts and settings.
 fn build_menu(app: &AppHandle, accounts: &[Account]) -> tauri::Result<Menu<Wry>> {
     let lang = settings::language(app);
     let mode = settings::name_mode(app);
+    let sort = settings::sort_mode(app);
     let l = i18n::labels(&lang);
+
+    // Computed once: the switch rows and the "remove account" submenu must
+    // list the accounts in the same order.
+    let ordered = sorted_accounts(app, accounts);
 
     let menu = Menu::new(app)?;
 
@@ -99,7 +138,7 @@ fn build_menu(app: &AppHandle, accounts: &[Account]) -> tauri::Result<Menu<Wry>>
         let hint = MenuItem::with_id(app, "noop-hint", l.no_accounts_hint, false, None::<&str>)?;
         menu.append(&hint)?;
     } else {
-        for account in accounts {
+        for &account in &ordered {
             let mut label = display_name(app, account);
             if account.is_current {
                 label = format!("{label}  •  {}", l.active);
@@ -126,7 +165,7 @@ fn build_menu(app: &AppHandle, accounts: &[Account]) -> tauri::Result<Menu<Wry>>
 
     if !accounts.is_empty() {
         let mut remove_menu = SubmenuBuilder::new(app, l.remove_account);
-        for account in accounts {
+        for &account in &ordered {
             let item = MenuItem::with_id(
                 app,
                 format!("remove:{}", account.account_id),
@@ -141,7 +180,7 @@ fn build_menu(app: &AppHandle, accounts: &[Account]) -> tauri::Result<Menu<Wry>>
 
     menu.append(&PredefinedMenuItem::separator(app)?)?;
 
-    // Settings submenu: language, display name, autostart.
+    // Settings submenu: language, display name, sort order, autostart.
     let lang_en =
         CheckMenuItem::with_id(app, "lang:en", "English", true, lang == "en", None::<&str>)?;
     let lang_de =
@@ -166,6 +205,27 @@ fn build_menu(app: &AppHandle, accounts: &[Account]) -> tauri::Result<Menu<Wry>>
         .item(&name_id)
         .build()?;
 
+    let sort_recent = CheckMenuItem::with_id(
+        app,
+        "sort:recent",
+        l.sort_recent,
+        true,
+        sort == "recent",
+        None::<&str>,
+    )?;
+    let sort_name = CheckMenuItem::with_id(
+        app,
+        "sort:name",
+        l.sort_name,
+        true,
+        sort == "name",
+        None::<&str>,
+    )?;
+    let sort_menu = SubmenuBuilder::new(app, l.sort_order)
+        .item(&sort_recent)
+        .item(&sort_name)
+        .build()?;
+
     let autostart_on = app.autolaunch().is_enabled().unwrap_or(false);
     let autostart =
         CheckMenuItem::with_id(app, "autostart", l.autostart, true, autostart_on, None::<&str>)?;
@@ -182,6 +242,7 @@ fn build_menu(app: &AppHandle, accounts: &[Account]) -> tauri::Result<Menu<Wry>>
     let settings_menu = SubmenuBuilder::new(app, l.settings)
         .item(&lang_menu)
         .item(&name_menu)
+        .item(&sort_menu)
         .item(&autostart)
         .item(&auto_capture)
         .build()?;
@@ -302,6 +363,12 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
         refresh(app);
     } else if id == "name:id" {
         settings::set_name_mode(app, "id");
+        refresh(app);
+    } else if id == "sort:recent" {
+        settings::set_sort_mode(app, "recent");
+        refresh(app);
+    } else if id == "sort:name" {
+        settings::set_sort_mode(app, "name");
         refresh(app);
     } else if id == "autostart" {
         let manager = app.autolaunch();

@@ -51,6 +51,28 @@ pub fn set_name_mode(app: &AppHandle, mode: &str) {
     }
 }
 
+/// How the tray menu orders accounts: "recent" (the order `list_accounts`
+/// produced — active first, then most recently used) or "name" (alphabetical).
+pub fn sort_mode(app: &AppHandle) -> String {
+    if let Ok(store) = app.store(STORE) {
+        if let Some(value) = store.get("sortMode") {
+            if let Some(s) = value.as_str() {
+                if s == "recent" || s == "name" {
+                    return s.to_string();
+                }
+            }
+        }
+    }
+    "recent".to_string()
+}
+
+pub fn set_sort_mode(app: &AppHandle, mode: &str) {
+    if let Ok(store) = app.store(STORE) {
+        store.set("sortMode", json!(mode));
+        let _ = store.save();
+    }
+}
+
 /// Whether new logins detected by the session watcher are saved into the
 /// switcher automatically. Defaults to on; explicit removals stay removed
 /// regardless (tombstones in the account store).
