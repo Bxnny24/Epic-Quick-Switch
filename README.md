@@ -26,7 +26,8 @@ window to open.
   straight into it, no password retyping
 - The **tray icon shows the active account's** colored initials badge
 - **Settings right in the tray menu:** language (English/German), display name
-  (Epic name or account ID), and start with Windows
+  (Epic name or account ID), sort order (last used or name), and start with
+  Windows
 - **Updates itself automatically**
 
 ---

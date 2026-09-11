@@ -44,7 +44,8 @@ Constraints:
     - `switch.rs` — kill/snapshot/write/relaunch orchestration
     - `icon.rs` — generated initials badges (tray + menu icons)
   - `tray.rs` — native tray menu (accounts, save, remove, settings), watcher
-  - `settings.rs` — `settings.json` via the store plugin (`language`, `nameMode`)
+  - `settings.rs` — `settings.json` via the store plugin (`language`, `nameMode`,
+    `sortMode`)
   - `i18n.rs` — English/German menu labels
   - `lib.rs` — app entry, plugin registration, background update check
 - `src/` — minimal React shell; no window is shown, it only satisfies the build
@@ -67,7 +68,8 @@ cargo test --manifest-path src-tauri/Cargo.toml -- --ignored --nocapture
 
 ## Settings & data
 
-- `%AppData%\Roaming\epic-quick-switch\settings.json` — `language`, `nameMode`
+- `%AppData%\Roaming\epic-quick-switch\settings.json` — `language`, `nameMode`,
+  `sortMode`
 - `%AppData%\Roaming\epic-quick-switch\accounts.json` — account snapshots; the
   session tokens inside are DPAPI-encrypted (current-user scope) and are never
   logged. A corrupt store is quarantined as `accounts.json.bad`.
