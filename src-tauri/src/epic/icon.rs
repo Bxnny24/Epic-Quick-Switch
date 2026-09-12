@@ -2,10 +2,12 @@
 //!
 //! Epic has no local avatar cache (unlike Steam's `avatarcache`), so each
 //! account gets a deterministic colored rounded square with its initial:
-//! the color is hashed from the account ID, the glyph comes from a tiny
-//! embedded 5×7 bitmap font (no font dependency).
+//! the color is hashed from the account ID, the glyph is rasterized from an
+//! embedded UI face (Outfit Regular, SIL OFL 1.1 — see `assets/fonts/OFL.txt`).
 
+use ab_glyph::{point, Font, FontRef, ScaleFont};
 use image::{Rgba, RgbaImage};
+use std::sync::OnceLock;
 
 /// Pleasant, white-glyph-friendly badge colors (picked by account-ID hash).
 const PALETTE: [[u8; 3]; 9] = [
@@ -22,9 +24,8 @@ const PALETTE: [[u8; 3]; 9] = [
 
 /// The character shown on the badge: the first glyph-mappable character of
 /// the display name, else of the account ID, else 'E'. Common accented Latin
-/// letters are transliterated (Ü -> U, é -> E, …) because the embedded font
-/// only covers A-Z/0-9 — without this, umlaut names would render the '?'
-/// fallback glyph.
+/// letters are transliterated (Ü -> U, é -> E, …) so the badge alphabet stays
+/// A-Z/0-9 — an umlaut's dots vanish into noise at an 18px menu icon anyway.
 pub fn initial_for(display_name: &str, account_id: &str) -> char {
     display_name
         .chars()
@@ -62,51 +63,97 @@ pub fn badge_rgba(account_id: &str, initial: char, size: u32) -> (Vec<u8>, u32) 
     (img.into_raw(), size)
 }
 
-/// Glyph height as a fraction of the badge size.
-const GLYPH_HEIGHT_RATIO: f32 = 0.6;
+/// Cap height of the glyph as a fraction of the badge size.
+const GLYPH_HEIGHT_RATIO: f32 = 0.5;
 
-/// Draw the 5×7 glyph centered, scaled to 60% of the badge height.
+/// Gamma applied to the rasterizer's coverage before blending. A stroke of
+/// this face is barely over a pixel wide at an 18px menu icon, so it is split
+/// across two partly covered pixels and linear blending leaves it looking
+/// washed out; pulling the midtones up restores the contrast without making
+/// the stroke any wider.
+const COVERAGE_GAMMA: f32 = 0.75;
+
+/// Draw the initial centered, its cap height scaled to half the badge.
 ///
-/// The glyph box is placed in floating-point coordinates and its cell edges
-/// are then snapped to the pixel grid, so the letter is exactly centered and
-/// hits the intended size at any badge size while staying pixel-crisp. Blowing
-/// the bitmap up by an integer factor instead rounds the scale down (a 7px
-/// glyph on an 18px badge — 39% instead of 60%) and dumps the truncated
-/// remainder of the centering divide on one side, shifting every letter a
-/// pixel up and to the left. Anti-aliasing the cells instead of snapping them
-/// centers just as well but smears the 1px strokes of a bitmap font into mush
-/// at tray-icon sizes.
+/// The letter is rasterized from a real outline with coverage-based
+/// anti-aliasing, which is what a badge this small needs: at an 18px menu
+/// icon a glyph cell of the old 5×7 bitmap font came out 1.54px wide, so
+/// snapping the cells to the pixel grid made every stroke alternate between
+/// 1px and 2px — the B grew a double-thick middle bar, the K lost the join of
+/// its diagonals. Outlines have no cell grid to snap, so each stroke lands at
+/// the same weight and the 20%-of-glyph-width stroke the bitmap font was
+/// stuck with drops to what the face actually draws.
 fn draw_glyph(img: &mut RgbaImage, ch: char, size: u32) {
-    let glyph = glyph_for(ch);
-    let cell = size as f32 * GLYPH_HEIGHT_RATIO / 7.0;
-    let cols = snapped_edges::<6>(size, cell);
-    let rows = snapped_edges::<8>(size, cell);
+    let font = font();
+    let cap = size as f32 * GLYPH_HEIGHT_RATIO;
+    let px = cap / cap_height_ratio();
+    let id = font.glyph_id(ch);
+    let Some(ink) = font.outline(id).map(|o| o.bounds) else {
+        return;
+    };
 
-    for (row, bits) in glyph.iter().enumerate() {
-        for col in 0..5usize {
-            if bits & (0b10000 >> col) == 0 {
-                continue;
-            }
-            for y in rows[row]..rows[row + 1] {
-                for x in cols[col]..cols[col + 1] {
-                    img.put_pixel(x, y, Rgba([255, 255, 255, 255]));
-                }
-            }
+    // Center the ink horizontally (centering the advance width instead would
+    // push a letter with lopsided side bearings off center) and the cap band
+    // vertically, so a descender (Q's tail) hangs below without dragging the
+    // rest of the alphabet upwards. Both offsets are handed to the rasterizer
+    // as fractions of a pixel: rounding them to whole pixels here would dump
+    // the half pixel that is left over when the badge and the ink differ by
+    // an odd number of pixels entirely on one side — which is what shifted
+    // the M half a pixel to the right.
+    let scale = font.as_scaled(px).h_scale_factor();
+    let x = (size as f32 - ink.width() * scale) / 2.0 - ink.min.x * scale;
+    let y = (size as f32 + cap) / 2.0;
+
+    let Some(outlined) = font.outline_glyph(id.with_scale_and_position(px, point(x, y))) else {
+        return;
+    };
+    let bounds = outlined.px_bounds();
+    let (left, top) = (bounds.min.x as i32, bounds.min.y as i32);
+
+    outlined.draw(|gx, gy, coverage| {
+        let (x, y) = (left + gx as i32, top + gy as i32);
+        if x < 0 || y < 0 || x >= size as i32 || y >= size as i32 {
+            return;
         }
-    }
+        // Blend white into the badge color; the badge is opaque here, so the
+        // coverage belongs in the color, not in the alpha the rounded mask
+        // is about to apply.
+        let alpha = coverage.clamp(0.0, 1.0).powf(COVERAGE_GAMMA);
+        let px = img.get_pixel_mut(x as u32, y as u32);
+        for channel in &mut px.0[..3] {
+            *channel = (*channel as f32 + (255.0 - *channel as f32) * alpha).round() as u8;
+        }
+    });
 }
 
-/// Pixel-grid edges of `N - 1` glyph cells of width `cell`, centered in
-/// `size`. Only the first half is rounded; the second is mirrored from it, so
-/// an edge that lands exactly on .5 cannot tip the glyph off center.
-fn snapped_edges<const N: usize>(size: u32, cell: f32) -> [u32; N] {
-    let start = (size as f32 - (N - 1) as f32 * cell) / 2.0;
-    let mut edges = [0u32; N];
-    for i in 0..N.div_ceil(2) {
-        edges[i] = (start + i as f32 * cell).round().clamp(0.0, size as f32) as u32;
-        edges[N - 1 - i] = size - edges[i];
-    }
-    edges
+/// The embedded face, parsed once.
+fn font() -> &'static FontRef<'static> {
+    static FONT: OnceLock<FontRef<'static>> = OnceLock::new();
+    FONT.get_or_init(|| {
+        FontRef::try_from_slice(include_bytes!("../../assets/fonts/Outfit-Regular.ttf"))
+            .expect("embedded badge font is a valid TTF")
+    })
+}
+
+/// Cap height of the embedded face, in pixels per unit of `PxScale`, measured
+/// once from the unscaled ink of an 'H'. `ab_glyph` exposes no cap-height
+/// metric, and the ink is what actually has to fill the badge anyway.
+fn cap_height_ratio() -> f32 {
+    static RATIO: OnceLock<f32> = OnceLock::new();
+    *RATIO.get_or_init(|| {
+        let font = font();
+        let ink = font
+            .outline(font.glyph_id('H'))
+            .expect("embedded badge font draws an 'H'")
+            .bounds;
+        // `Outline::bounds` holds font units, which grow upwards, but names
+        // its corners for the y-down box `px_bounds` flips them into — so the
+        // cap height is `min.y - max.y` and `height()` would come out negative.
+        // A `PxScale` is the face's full line height rather than its em, so the
+        // conversion has to go through `ab_glyph`'s own factor: dividing by
+        // `units_per_em` overshoots by the descender and line gap.
+        (ink.min.y - ink.max.y) * font.as_scaled(1.0).v_scale_factor()
+    })
 }
 
 /// Apply an anti-aliased rounded-rectangle (rounded square) alpha mask in
@@ -142,49 +189,6 @@ fn fnv1a(input: &str) -> u32 {
     hash
 }
 
-/// 5×7 bitmap glyphs, one `u8` per row, low 5 bits used (MSB = leftmost).
-fn glyph_for(ch: char) -> [u8; 7] {
-    match ch.to_ascii_uppercase() {
-        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
-        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
-        'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
-        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
-        'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
-        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111],
-        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100],
-        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
-        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
-        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
-        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
-        'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
-        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
-        'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
-        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
-        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
-        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
-        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
-        'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
-        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
-        '3' => [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
-        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-        '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
-        '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
-        _ => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100],
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,24 +202,40 @@ mod tests {
         assert_eq!(rgba[3], 0, "top-left corner must be transparent");
         let center = ((16 * 32 + 16) * 4 + 3) as usize;
         assert_eq!(rgba[center], 255, "center must be opaque");
-        // The glyph paints at least some white pixels.
-        assert!(
-            rgba.chunks_exact(4).any(|px| px == [255, 255, 255, 255]),
-            "expected white glyph pixels"
-        );
+        // The glyph paints near-white ink over the badge color.
+        let brightest = rgba
+            .chunks_exact(4)
+            .map(|px| px[0] as u32 + px[1] as u32 + px[2] as u32)
+            .max()
+            .expect("badge is not empty");
+        assert!(brightest >= 3 * 240, "expected near-white glyph ink");
+    }
+
+    /// Per-pixel ink coverage, 0.0 where the badge color shows through and
+    /// 1.0 where the glyph painted solid white. The corner pixel is never
+    /// touched by the glyph and the rounded mask only edits alpha, so its RGB
+    /// is the untouched background color.
+    fn coverage(rgba: &[u8], size: u32) -> Vec<f32> {
+        let bg: Vec<f32> = rgba[0..3].iter().map(|c| *c as f32).collect();
+        (0..(size * size) as usize)
+            .map(|i| {
+                let px = &rgba[i * 4..i * 4 + 3];
+                let lit: f32 = (0..3)
+                    .map(|c| (px[c] as f32 - bg[c]) / (255.0 - bg[c]).max(1.0))
+                    .sum();
+                (lit / 3.0).clamp(0.0, 1.0)
+            })
+            .collect()
     }
 
     /// Half-open bounding box `(x0, y0, x1, y1)` of the pixels the glyph
-    /// painted over the flat background. The corner pixel is never touched by
-    /// the glyph and the rounded mask only edits alpha, so its RGB is the
-    /// untouched background color.
+    /// painted over the flat background.
     fn lit_bounds(rgba: &[u8], size: u32) -> (u32, u32, u32, u32) {
-        let bg = &rgba[0..3];
+        let cov = coverage(rgba, size);
         let (mut x0, mut y0, mut x1, mut y1) = (size, size, 0, 0);
         for y in 0..size {
             for x in 0..size {
-                let i = ((y * size + x) * 4) as usize;
-                if rgba[i..i + 3] != *bg {
+                if cov[(y * size + x) as usize] > 0.0 {
                     x0 = x0.min(x);
                     y0 = y0.min(y);
                     x1 = x1.max(x + 1);
@@ -226,30 +246,50 @@ mod tests {
         (x0, y0, x1, y1)
     }
 
+    /// Coverage-weighted center of the ink, in pixels from the badge center.
+    fn ink_offset(rgba: &[u8], size: u32) -> (f32, f32) {
+        let cov = coverage(rgba, size);
+        let (mut total, mut wx, mut wy) = (0.0, 0.0, 0.0);
+        for y in 0..size {
+            for x in 0..size {
+                let c = cov[(y * size + x) as usize];
+                total += c;
+                wx += c * (x as f32 + 0.5);
+                wy += c * (y as f32 + 0.5);
+            }
+        }
+        let center = size as f32 / 2.0;
+        (wx / total - center, wy / total - center)
+    }
+
     #[test]
     fn glyph_is_centered_at_every_size() {
-        // 'H' is symmetric on both axes, and so is the rounded mask — so a
-        // correctly centered badge equals its own mirror image. Sizes are
-        // picked so the glyph box lands both on and off pixel boundaries.
+        // Measured on the ink's center of mass, not its bounding box: placing
+        // the glyph on whole pixels used to leave the M half a pixel right of
+        // center, which a box that rounds outwards to the same margins on
+        // both sides cannot see. Sizes are picked so the outline lands both on
+        // and off pixel boundaries; the letters are the ones symmetric about
+        // their vertical axis, so their mass belongs dead center horizontally.
         for size in [16u32, 18, 20, 24, 32, 64] {
-            let (rgba, _) = badge_rgba("mirror", 'H', size);
-            for y in 0..size {
-                for x in 0..size {
-                    let px = |x: u32, y: u32| {
-                        let i = ((y * size + x) * 4) as usize;
-                        &rgba[i..i + 4]
-                    };
-                    assert_eq!(
-                        px(x, y),
-                        px(size - 1 - x, y),
-                        "size {size}: ({x},{y}) is not mirrored horizontally"
-                    );
-                    assert_eq!(
-                        px(x, y),
-                        px(x, size - 1 - y),
-                        "size {size}: ({x},{y}) is not mirrored vertically"
-                    );
-                }
+            for ch in ['M', 'H', 'O', 'A', 'W', 'X', 'T', 'I'] {
+                let (rgba, _) = badge_rgba("center", ch, size);
+                let (dx, _) = ink_offset(&rgba, size);
+                assert!(
+                    dx.abs() <= 0.1,
+                    "size {size}: '{ch}' sits {dx:+.3}px off horizontal center"
+                );
+            }
+            // Vertically the cap band is what is centered, and only letters
+            // that fill it evenly can be checked by their mass — an 'A' is a
+            // triangle and a 'T' a bar on a stem, so both weigh in off center
+            // by design.
+            for ch in ['H', 'O', 'X'] {
+                let (rgba, _) = badge_rgba("center", ch, size);
+                let (_, dy) = ink_offset(&rgba, size);
+                assert!(
+                    dy.abs() <= 0.2,
+                    "size {size}: '{ch}' sits {dy:+.3}px off vertical center"
+                );
             }
         }
     }
@@ -258,20 +298,39 @@ mod tests {
     fn glyph_fills_the_intended_share_of_the_badge() {
         for size in [16u32, 18, 20, 24, 32, 64] {
             let (rgba, _) = badge_rgba("height", 'H', size);
-            let (x0, y0, x1, y1) = lit_bounds(&rgba, size);
-            // 'H' spans the full 5×7 cell grid, so its ink is the glyph box:
-            // 60% of the badge tall, 5/7 of that wide, give or take the pixel
-            // each edge gains or loses when it snaps to the grid.
-            let want_h = size as f32 * GLYPH_HEIGHT_RATIO;
-            let want_w = want_h * 5.0 / 7.0;
-            let (got_h, got_w) = ((y1 - y0) as f32, (x1 - x0) as f32);
+            let (_, y0, _, y1) = lit_bounds(&rgba, size);
+            // 'H' has no overshoot, so its ink height is the cap height, up
+            // to the anti-aliased fringe and the rounded placement.
+            let want = size as f32 * GLYPH_HEIGHT_RATIO;
+            let got = (y1 - y0) as f32;
             assert!(
-                got_h >= want_h.floor() && got_h <= want_h + 2.0,
-                "size {size}: glyph height {got_h} is not ~{want_h}"
+                (got - want).abs() <= 1.5,
+                "size {size}: glyph height {got} is not ~{want}"
             );
+        }
+    }
+
+    #[test]
+    fn strokes_keep_an_even_weight() {
+        // The bug this replaced: a bitmap font scaled by a fractional factor
+        // snapped its cells to the grid, so the two stems of an 'H' came out
+        // 2px and 1px wide on the same badge. Both stems are measured on the
+        // row through the crossbar-free upper half.
+        for size in [16u32, 18, 20, 24, 32] {
+            let (rgba, _) = badge_rgba("weight", 'H', size);
+            let (_, y0, _, y1) = lit_bounds(&rgba, size);
+            let row = y0 + (y1 - y0) / 5;
+            let cov = coverage(&rgba, size);
+            let stems: Vec<f32> = cov[(row * size) as usize..((row + 1) * size) as usize]
+                .split(|c| *c <= 0.0)
+                .filter(|run| !run.is_empty())
+                .map(|run| run.iter().sum())
+                .collect();
+            assert_eq!(stems.len(), 2, "size {size}: expected two stems of 'H'");
             assert!(
-                got_w >= want_w.floor() && got_w <= want_w + 2.0,
-                "size {size}: glyph width {got_w} is not ~{want_w}"
+                (stems[0] - stems[1]).abs() <= 0.35,
+                "size {size}: stems weigh {:?} — uneven",
+                stems
             );
         }
     }
@@ -304,8 +363,9 @@ mod tests {
     #[test]
     fn all_needed_glyphs_are_nonempty() {
         for ch in ('A'..='Z').chain('0'..='9') {
-            let glyph = glyph_for(ch);
-            assert!(glyph.iter().any(|row| *row != 0), "glyph {ch} is empty");
+            let (rgba, size) = badge_rgba("glyphs", ch, 32);
+            let (x0, y0, x1, y1) = lit_bounds(&rgba, size);
+            assert!(x1 > x0 && y1 > y0, "glyph {ch} painted nothing");
         }
     }
 }
