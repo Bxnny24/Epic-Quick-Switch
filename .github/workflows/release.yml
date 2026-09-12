@@ -40,11 +40,19 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Read release notes
+      - name: Generate changelog
         id: notes
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $body = Get-Content .github/release-notes.md -Raw
+          # GitHub's own generator: the pull requests merged since the previous
+          # tag, and nothing else. The release body is a changelog — what the
+          # app does belongs in the README, not in every release.
+          $body = gh api "repos/$env:GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$env:GITHUB_REF_NAME" --jq .body
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($body)) {
+            throw "Could not generate release notes for $env:GITHUB_REF_NAME"
+          }
           $delim = "EOF_RELEASE_NOTES"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "body<<$delim" -Encoding utf8
           Add-Content -Path $env:GITHUB_OUTPUT -Value $body -Encoding utf8

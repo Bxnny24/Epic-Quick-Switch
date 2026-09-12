@@ -61,11 +61,19 @@ download badge.
 
 ## Release description
 
-The body of every GitHub Release is the contents of
-[`.github/release-notes.md`](.github/release-notes.md) — a bulleted list of all
-app features. It is not generated, so keep it up to date: whenever a change adds
-or alters a user-facing feature, edit that file in the same PR. The workflow
-reads it at build time, so what ships is whatever sits on the tagged commit.
+The body of every GitHub Release is a **changelog**: only what is new in that
+version, nothing else. The workflow asks GitHub's `releases/generate-notes` API
+for it, so the body is the list of pull requests merged since the previous tag —
+there is no file to maintain.
+
+Two things follow from that:
+
+- **Land user-facing changes through a pull request.** Commits pushed straight
+  to `main` do not appear in the generated notes.
+- **The PR title is the changelog entry.** Write it for someone reading the
+  release page, not for the diff.
+
+What the app *does* belongs in the README, not in every release body.
 
 > The tag (e.g. `v0.1.1`) must be a **higher** version than what users have
 > installed, otherwise the updater sees no newer version and does nothing.
