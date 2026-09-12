@@ -62,31 +62,51 @@ pub fn badge_rgba(account_id: &str, initial: char, size: u32) -> (Vec<u8>, u32) 
     (img.into_raw(), size)
 }
 
-/// Draw the 5×7 glyph centered, scaled to roughly 60% of the badge height.
+/// Glyph height as a fraction of the badge size.
+const GLYPH_HEIGHT_RATIO: f32 = 0.6;
+
+/// Draw the 5×7 glyph centered, scaled to 60% of the badge height.
+///
+/// The glyph box is placed in floating-point coordinates and its cell edges
+/// are then snapped to the pixel grid, so the letter is exactly centered and
+/// hits the intended size at any badge size while staying pixel-crisp. Blowing
+/// the bitmap up by an integer factor instead rounds the scale down (a 7px
+/// glyph on an 18px badge — 39% instead of 60%) and dumps the truncated
+/// remainder of the centering divide on one side, shifting every letter a
+/// pixel up and to the left. Anti-aliasing the cells instead of snapping them
+/// centers just as well but smears the 1px strokes of a bitmap font into mush
+/// at tray-icon sizes.
 fn draw_glyph(img: &mut RgbaImage, ch: char, size: u32) {
     let glyph = glyph_for(ch);
-    let scale = ((size * 3 / 5) / 7).max(1);
-    let width = 5 * scale;
-    let height = 7 * scale;
-    let x0 = (size.saturating_sub(width)) / 2;
-    let y0 = (size.saturating_sub(height)) / 2;
+    let cell = size as f32 * GLYPH_HEIGHT_RATIO / 7.0;
+    let cols = snapped_edges::<6>(size, cell);
+    let rows = snapped_edges::<8>(size, cell);
 
     for (row, bits) in glyph.iter().enumerate() {
-        for col in 0..5u32 {
+        for col in 0..5usize {
             if bits & (0b10000 >> col) == 0 {
                 continue;
             }
-            for dy in 0..scale {
-                for dx in 0..scale {
-                    let x = x0 + col * scale + dx;
-                    let y = y0 + row as u32 * scale + dy;
-                    if x < size && y < size {
-                        img.put_pixel(x, y, Rgba([255, 255, 255, 255]));
-                    }
+            for y in rows[row]..rows[row + 1] {
+                for x in cols[col]..cols[col + 1] {
+                    img.put_pixel(x, y, Rgba([255, 255, 255, 255]));
                 }
             }
         }
     }
+}
+
+/// Pixel-grid edges of `N - 1` glyph cells of width `cell`, centered in
+/// `size`. Only the first half is rounded; the second is mirrored from it, so
+/// an edge that lands exactly on .5 cannot tip the glyph off center.
+fn snapped_edges<const N: usize>(size: u32, cell: f32) -> [u32; N] {
+    let start = (size as f32 - (N - 1) as f32 * cell) / 2.0;
+    let mut edges = [0u32; N];
+    for i in 0..N.div_ceil(2) {
+        edges[i] = (start + i as f32 * cell).round().clamp(0.0, size as f32) as u32;
+        edges[N - 1 - i] = size - edges[i];
+    }
+    edges
 }
 
 /// Apply an anti-aliased rounded-rectangle (rounded square) alpha mask in
@@ -183,6 +203,77 @@ mod tests {
             rgba.chunks_exact(4).any(|px| px == [255, 255, 255, 255]),
             "expected white glyph pixels"
         );
+    }
+
+    /// Half-open bounding box `(x0, y0, x1, y1)` of the pixels the glyph
+    /// painted over the flat background. The corner pixel is never touched by
+    /// the glyph and the rounded mask only edits alpha, so its RGB is the
+    /// untouched background color.
+    fn lit_bounds(rgba: &[u8], size: u32) -> (u32, u32, u32, u32) {
+        let bg = &rgba[0..3];
+        let (mut x0, mut y0, mut x1, mut y1) = (size, size, 0, 0);
+        for y in 0..size {
+            for x in 0..size {
+                let i = ((y * size + x) * 4) as usize;
+                if rgba[i..i + 3] != *bg {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x + 1);
+                    y1 = y1.max(y + 1);
+                }
+            }
+        }
+        (x0, y0, x1, y1)
+    }
+
+    #[test]
+    fn glyph_is_centered_at_every_size() {
+        // 'H' is symmetric on both axes, and so is the rounded mask — so a
+        // correctly centered badge equals its own mirror image. Sizes are
+        // picked so the glyph box lands both on and off pixel boundaries.
+        for size in [16u32, 18, 20, 24, 32, 64] {
+            let (rgba, _) = badge_rgba("mirror", 'H', size);
+            for y in 0..size {
+                for x in 0..size {
+                    let px = |x: u32, y: u32| {
+                        let i = ((y * size + x) * 4) as usize;
+                        &rgba[i..i + 4]
+                    };
+                    assert_eq!(
+                        px(x, y),
+                        px(size - 1 - x, y),
+                        "size {size}: ({x},{y}) is not mirrored horizontally"
+                    );
+                    assert_eq!(
+                        px(x, y),
+                        px(x, size - 1 - y),
+                        "size {size}: ({x},{y}) is not mirrored vertically"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn glyph_fills_the_intended_share_of_the_badge() {
+        for size in [16u32, 18, 20, 24, 32, 64] {
+            let (rgba, _) = badge_rgba("height", 'H', size);
+            let (x0, y0, x1, y1) = lit_bounds(&rgba, size);
+            // 'H' spans the full 5×7 cell grid, so its ink is the glyph box:
+            // 60% of the badge tall, 5/7 of that wide, give or take the pixel
+            // each edge gains or loses when it snaps to the grid.
+            let want_h = size as f32 * GLYPH_HEIGHT_RATIO;
+            let want_w = want_h * 5.0 / 7.0;
+            let (got_h, got_w) = ((y1 - y0) as f32, (x1 - x0) as f32);
+            assert!(
+                got_h >= want_h.floor() && got_h <= want_h + 2.0,
+                "size {size}: glyph height {got_h} is not ~{want_h}"
+            );
+            assert!(
+                got_w >= want_w.floor() && got_w <= want_w + 2.0,
+                "size {size}: glyph width {got_w} is not ~{want_w}"
+            );
+        }
     }
 
     #[test]
