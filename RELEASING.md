@@ -63,8 +63,10 @@ download badge.
 
 The body of every GitHub Release is a **changelog**: only what is new in that
 version, nothing else. The workflow asks GitHub's `releases/generate-notes` API
-for it, so the body is the list of pull requests merged since the previous tag —
-there is no file to maintain.
+for it and then strips it down to the bare change titles — no contributor
+handles, no pull request numbers or links, no "New Contributors" section. There
+is no file to maintain. If anything of that sort survives the filter, the
+release build fails rather than publishing it.
 
 Two things follow from that:
 
