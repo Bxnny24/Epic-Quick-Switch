@@ -61,12 +61,19 @@ download badge.
 
 ## Release description
 
-The body of every GitHub Release is a **changelog**: only what is new in that
-version, nothing else. The workflow asks GitHub's `releases/generate-notes` API
-for it and then strips it down to the bare change titles — no contributor
-handles, no pull request numbers or links, no "New Contributors" section. There
-is no file to maintain. If anything of that sort survives the filter, the
-release build fails rather than publishing it.
+The body of every GitHub Release is a short **bullet list of what changed in
+that version** — nothing else. No headings, no compare link, no contributor
+handles, no pull request numbers or links:
+
+```
+- fix(icon): center the badge initial exactly and at the intended size
+- feat(tray): add a sort order setting for the account list
+```
+
+The workflow asks GitHub's `releases/generate-notes` API for the entries and
+strips the rest away, so there is no file to maintain. The release build fails
+rather than publishing anything that does not look like that: a handle or link
+surviving the filter, or no entries at all.
 
 Two things follow from that:
 
