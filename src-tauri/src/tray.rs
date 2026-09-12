@@ -296,6 +296,11 @@ fn refresh_icon(app: &AppHandle, accounts: &[Account]) {
 
 /// Create the tray icon and menu. Split out of [`setup`] because
 /// [`start_registration_guard`] may have to build the icon a second time.
+///
+/// Deliberately does NOT call `TrayIconBuilder::on_menu_event` — see
+/// [`setup`]. A handler passed there is pushed onto the app-wide menu
+/// listener list and never taken off it again, not even when the tray icon it
+/// came with is dropped, so every rebuild would leave another copy behind.
 fn create_tray(app: &AppHandle) -> tauri::Result<()> {
     let accounts = epic::list_accounts(app).unwrap_or_default();
     let menu = build_menu(app, &accounts)?;
@@ -304,14 +309,25 @@ fn create_tray(app: &AppHandle) -> tauri::Result<()> {
         .tooltip("Epic Quick Switch")
         .menu(&menu)
         .show_menu_on_left_click(true)
-        .on_menu_event(|app, event| handle_menu_event(app, event.id().as_ref()))
         .build(app)?;
     refresh_icon(app, &accounts);
     Ok(())
 }
 
 /// Create the tray icon and menu on startup.
+///
+/// The menu handler is registered here, once for the process, rather than on
+/// the tray icon. `TrayIcon::register` *pushes* a builder's menu handler onto
+/// `manager.menu.global_event_listeners` — a plain list with no removal path,
+/// unlike the tray *icon* event handler right beside it, which is keyed by
+/// tray id and so gets replaced on a rebuild. Dropping the old icon therefore
+/// unregisters the icon but leaves its menu handler behind, and every rebuild
+/// by [`start_registration_guard`] added one more. A single click on an
+/// account then ran [`handle_menu_event`] twice: the first call performed the
+/// switch, the second reported it as already in progress. Registering once
+/// globally keeps a rebuild free of side effects.
 pub fn setup(app: &AppHandle) -> tauri::Result<()> {
+    app.on_menu_event(|app, event| handle_menu_event(app, event.id().as_ref()));
     create_tray(app)?;
     start_session_watcher(app);
     start_registration_guard(app);
